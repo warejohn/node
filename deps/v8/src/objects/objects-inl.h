@@ -67,10 +67,6 @@ int PropertyDetails::field_width_in_words() const {
   return representation().IsDouble() ? kDoubleSize / kTaggedSize : 1;
 }
 
-DEF_GETTER(HeapObject, IsSloppyArgumentsElements, bool) {
-  return IsFixedArrayExact(isolate);
-}
-
 DEF_GETTER(HeapObject, IsClassBoilerplate, bool) {
   return IsFixedArrayExact(isolate);
 }
@@ -703,17 +699,17 @@ ReadOnlyRoots HeapObject::GetReadOnlyRoots(const Isolate* isolate) const {
 DEF_GETTER(HeapObject, map, Map) { return map_word(isolate).ToMap(); }
 
 void HeapObject::set_map(Map value) {
-  if (!value.is_null()) {
 #ifdef VERIFY_HEAP
+  if (FLAG_verify_heap && !value.is_null()) {
     GetHeapFromWritableObject(*this)->VerifyObjectLayoutChange(*this, value);
-#endif
   }
+#endif
   set_map_word(MapWord::FromMap(value));
 #ifndef V8_DISABLE_WRITE_BARRIERS
   if (!value.is_null()) {
     // TODO(1600) We are passing kNullAddress as a slot because maps can never
     // be on an evacuation candidate.
-    MarkingBarrier(*this, ObjectSlot(kNullAddress), value);
+    WriteBarrier::Marking(*this, ObjectSlot(kNullAddress), value);
   }
 #endif
 }
@@ -723,28 +719,28 @@ DEF_GETTER(HeapObject, synchronized_map, Map) {
 }
 
 void HeapObject::synchronized_set_map(Map value) {
-  if (!value.is_null()) {
 #ifdef VERIFY_HEAP
+  if (FLAG_verify_heap && !value.is_null()) {
     GetHeapFromWritableObject(*this)->VerifyObjectLayoutChange(*this, value);
-#endif
   }
+#endif
   synchronized_set_map_word(MapWord::FromMap(value));
 #ifndef V8_DISABLE_WRITE_BARRIERS
   if (!value.is_null()) {
     // TODO(1600) We are passing kNullAddress as a slot because maps can never
     // be on an evacuation candidate.
-    MarkingBarrier(*this, ObjectSlot(kNullAddress), value);
+    WriteBarrier::Marking(*this, ObjectSlot(kNullAddress), value);
   }
 #endif
 }
 
 // Unsafe accessor omitting write barrier.
 void HeapObject::set_map_no_write_barrier(Map value) {
-  if (!value.is_null()) {
 #ifdef VERIFY_HEAP
+  if (FLAG_verify_heap && !value.is_null()) {
     GetHeapFromWritableObject(*this)->VerifyObjectLayoutChange(*this, value);
-#endif
   }
+#endif
   set_map_word(MapWord::FromMap(value));
 }
 
@@ -755,7 +751,7 @@ void HeapObject::set_map_after_allocation(Map value, WriteBarrierMode mode) {
     DCHECK(!value.is_null());
     // TODO(1600) We are passing kNullAddress as a slot because maps can never
     // be on an evacuation candidate.
-    MarkingBarrier(*this, ObjectSlot(kNullAddress), value);
+    WriteBarrier::Marking(*this, ObjectSlot(kNullAddress), value);
   }
 #endif
 }

@@ -97,6 +97,8 @@ NEVER_READ_ONLY_SPACE_IMPL(SharedFunctionInfo)
 CAST_ACCESSOR(SharedFunctionInfo)
 DEFINE_DEOPT_ELEMENT_ACCESSORS(SharedFunctionInfo, Object)
 
+SYNCHRONIZED_ACCESSORS(SharedFunctionInfo, function_data, Object,
+                       kFunctionDataOffset)
 ACCESSORS(SharedFunctionInfo, name_or_scope_info, Object,
           kNameOrScopeInfoOffset)
 ACCESSORS(SharedFunctionInfo, script_or_debug_info, HeapObject,
@@ -168,15 +170,6 @@ AbstractCode SharedFunctionInfo::abstract_code() {
   }
 }
 
-Object SharedFunctionInfo::function_data() const {
-  return ACQUIRE_READ_FIELD(*this, kFunctionDataOffset);
-}
-
-void SharedFunctionInfo::set_function_data(Object data, WriteBarrierMode mode) {
-  RELEASE_WRITE_FIELD(*this, kFunctionDataOffset, data);
-  CONDITIONAL_WRITE_BARRIER(*this, kFunctionDataOffset, data, mode);
-}
-
 int SharedFunctionInfo::function_token_position() const {
   int offset = raw_function_token_offset();
   if (offset == kFunctionTokenOutOfRange) {
@@ -192,6 +185,9 @@ BIT_FIELD_ACCESSORS(SharedFunctionInfo, flags2, class_scope_has_private_brand,
 BIT_FIELD_ACCESSORS(SharedFunctionInfo, flags2,
                     has_static_private_methods_or_accessors,
                     SharedFunctionInfo::HasStaticPrivateMethodsOrAccessorsBit)
+
+BIT_FIELD_ACCESSORS(SharedFunctionInfo, flags2, may_have_cached_code,
+                    SharedFunctionInfo::MayHaveCachedCodeBit)
 
 BIT_FIELD_ACCESSORS(SharedFunctionInfo, flags, syntax_kind,
                     SharedFunctionInfo::FunctionSyntaxKindBits)
@@ -421,12 +417,15 @@ bool SharedFunctionInfo::is_compiled() const {
          !data.IsUncompiledData();
 }
 
-IsCompiledScope SharedFunctionInfo::is_compiled_scope() const {
-  return IsCompiledScope(*this, GetIsolate());
+template <typename LocalIsolate>
+IsCompiledScope SharedFunctionInfo::is_compiled_scope(
+    LocalIsolate* isolate) const {
+  return IsCompiledScope(*this, isolate);
 }
 
+template <typename LocalIsolate>
 IsCompiledScope::IsCompiledScope(const SharedFunctionInfo shared,
-                                 Isolate* isolate)
+                                 LocalIsolate* isolate)
     : retain_bytecode_(shared.HasBytecodeArray()
                            ? handle(shared.GetBytecodeArray(), isolate)
                            : MaybeHandle<BytecodeArray>()),

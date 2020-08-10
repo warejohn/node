@@ -26,6 +26,7 @@ namespace internal {
 // Forward declarations.
 class AliasedArgumentsEntry;
 class ObjectBoilerplateDescription;
+class BasicBlockProfilerData;
 class BreakPoint;
 class BreakPointInfo;
 class CallableTask;
@@ -60,6 +61,7 @@ class ScriptContextTable;
 class SourceTextModule;
 class StackFrameInfo;
 class StackTraceFrame;
+class StringSet;
 class StoreHandler;
 class SyntheticModule;
 class TemplateObjectDescription;
@@ -118,6 +120,10 @@ class V8_EXPORT_PRIVATE Factory : public FactoryBase<Factory> {
 
   // Marks self references within code generation.
   Handle<Oddball> NewSelfReferenceMarker();
+
+  // Marks references to a function's basic-block usage counters array during
+  // code generation.
+  Handle<Oddball> NewBasicBlockCountersMarker();
 
   // Allocates a property array initialized with undefined values.
   Handle<PropertyArray> NewPropertyArray(int length);
@@ -342,7 +348,7 @@ class V8_EXPORT_PRIVATE Factory : public FactoryBase<Factory> {
                                           Handle<ScopeInfo> scope_info,
                                           Handle<JSReceiver> extension,
                                           Handle<Context> wrapped,
-                                          Handle<StringSet> whitelist);
+                                          Handle<StringSet> blocklist);
 
   // Create a block context.
   Handle<Context> NewBlockContext(Handle<Context> previous,
@@ -413,8 +419,6 @@ class V8_EXPORT_PRIVATE Factory : public FactoryBase<Factory> {
       AllocationOrigin origin = AllocationOrigin::kRuntime);
 
   Handle<JSObject> NewFunctionPrototype(Handle<JSFunction> function);
-
-  Handle<WeakCell> NewWeakCell();
 
   // Returns a deep copy of the JavaScript object.
   // Properties and elements are copied too.
@@ -548,7 +552,8 @@ class V8_EXPORT_PRIVATE Factory : public FactoryBase<Factory> {
 
   Handle<JSModuleNamespace> NewJSModuleNamespace();
 
-  Handle<WasmStruct> NewWasmStruct(Handle<Map> map);
+  Handle<WasmTypeInfo> NewWasmTypeInfo(Address type_address,
+                                       Handle<Map> parent);
 
   Handle<SourceTextModule> NewSourceTextModule(Handle<SharedFunctionInfo> code);
   Handle<SyntheticModule> NewSyntheticModule(
@@ -791,7 +796,7 @@ class V8_EXPORT_PRIVATE Factory : public FactoryBase<Factory> {
   // which tries to gracefully handle allocation failure.
   class V8_EXPORT_PRIVATE CodeBuilder final {
    public:
-    CodeBuilder(Isolate* isolate, const CodeDesc& desc, Code::Kind kind);
+    CodeBuilder(Isolate* isolate, const CodeDesc& desc, CodeKind kind);
 
     // Builds a new code object (fully initialized). All header fields of the
     // returned object are immutable and the code object is write protected.
@@ -861,12 +866,17 @@ class V8_EXPORT_PRIVATE Factory : public FactoryBase<Factory> {
       return *this;
     }
 
+    CodeBuilder& set_profiler_data(BasicBlockProfilerData* profiler_data) {
+      profiler_data_ = profiler_data;
+      return *this;
+    }
+
    private:
     MaybeHandle<Code> BuildInternal(bool retry_allocation_or_fail);
 
     Isolate* const isolate_;
     const CodeDesc& code_desc_;
-    const Code::Kind kind_;
+    const CodeKind kind_;
 
     MaybeHandle<Object> self_reference_;
     int32_t builtin_index_ = Builtins::kNoBuiltinId;
@@ -875,6 +885,7 @@ class V8_EXPORT_PRIVATE Factory : public FactoryBase<Factory> {
     Handle<ByteArray> source_position_table_;
     Handle<DeoptimizationData> deoptimization_data_ =
         DeoptimizationData::Empty(isolate_);
+    BasicBlockProfilerData* profiler_data_ = nullptr;
     bool is_executable_ = true;
     bool read_only_data_container_ = false;
     bool is_movable_ = true;

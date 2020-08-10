@@ -4,8 +4,10 @@
 
 #include "src/heap/heap.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <iomanip>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -30,8 +32,10 @@
 #include "src/heap/array-buffer-sweeper.h"
 #include "src/heap/array-buffer-tracker-inl.h"
 #include "src/heap/barrier.h"
+#include "src/heap/code-object-registry.h"
 #include "src/heap/code-stats.h"
 #include "src/heap/combined-heap.h"
+#include "src/heap/concurrent-allocator.h"
 #include "src/heap/concurrent-marking.h"
 #include "src/heap/embedder-tracing.h"
 #include "src/heap/finalization-registry-cleanup-task.h"
@@ -45,14 +49,17 @@
 #include "src/heap/local-heap.h"
 #include "src/heap/mark-compact-inl.h"
 #include "src/heap/mark-compact.h"
+#include "src/heap/marking-barrier-inl.h"
+#include "src/heap/marking-barrier.h"
 #include "src/heap/memory-chunk-inl.h"
 #include "src/heap/memory-measurement.h"
 #include "src/heap/memory-reducer.h"
 #include "src/heap/object-stats.h"
 #include "src/heap/objects-visiting-inl.h"
 #include "src/heap/objects-visiting.h"
+#include "src/heap/paged-spaces-inl.h"
 #include "src/heap/read-only-heap.h"
-#include "src/heap/remembered-set-inl.h"
+#include "src/heap/remembered-set.h"
 #include "src/heap/safepoint.h"
 #include "src/heap/scavenge-job.h"
 #include "src/heap/scavenger-inl.h"
@@ -107,35 +114,13 @@ void Heap_GenerationalBarrierSlow(HeapObject object, Address slot,
   Heap::GenerationalBarrierSlow(object, slot, value);
 }
 
-void Heap_MarkingBarrierSlow(HeapObject object, Address slot,
-                             HeapObject value) {
-  Heap::MarkingBarrierSlow(object, slot, value);
-}
-
 void Heap_WriteBarrierForCodeSlow(Code host) {
   Heap::WriteBarrierForCodeSlow(host);
-}
-
-void Heap_MarkingBarrierForArrayBufferExtensionSlow(
-    HeapObject object, ArrayBufferExtension* extension) {
-  Heap::MarkingBarrierForArrayBufferExtensionSlow(object, extension);
 }
 
 void Heap_GenerationalBarrierForCodeSlow(Code host, RelocInfo* rinfo,
                                          HeapObject object) {
   Heap::GenerationalBarrierForCodeSlow(host, rinfo, object);
-}
-
-void Heap_MarkingBarrierForCodeSlow(Code host, RelocInfo* rinfo,
-                                    HeapObject object) {
-  Heap::MarkingBarrierForCodeSlow(host, rinfo, object);
-}
-
-void Heap_MarkingBarrierForDescriptorArraySlow(Heap* heap, HeapObject host,
-                                               HeapObject descriptor_array,
-                                               int number_of_own_descriptors) {
-  Heap::MarkingBarrierForDescriptorArraySlow(heap, host, descriptor_array,
-                                             number_of_own_descriptors);
 }
 
 void Heap_GenerationalEphemeronKeyBarrierSlow(Heap* heap,
@@ -172,6 +157,10 @@ void Heap::SetSerializedObjects(FixedArray objects) {
 void Heap::SetSerializedGlobalProxySizes(FixedArray sizes) {
   DCHECK(isolate()->serializer_enabled());
   set_serialized_global_proxy_sizes(sizes);
+}
+
+void Heap::SetBasicBlockProfilingData(Handle<ArrayList> list) {
+  set_basic_block_profiling_data(*list);
 }
 
 bool Heap::GCCallbackTuple::operator==(
@@ -415,7 +404,12 @@ bool Heap::CanExpandOldGeneration(size_t size) {
   return memory_allocator()->Size() + size <= MaxReserved();
 }
 
-bool Heap::HasBeenSetUp() {
+bool Heap::CanExpandOldGenerationBackground(size_t size) {
+  if (force_oom_) return false;
+  return memory_allocator()->Size() + size <= MaxReserved();
+}
+
+bool Heap::HasBeenSetUp() const {
   // We will always have a new space when the heap is set up.
   return new_space_ != nullptr;
 }
@@ -456,7 +450,7 @@ GarbageCollector Heap::SelectGarbageCollector(AllocationSpace space,
 }
 
 void Heap::SetGCState(HeapState state) {
-  gc_state_ = state;
+  gc_state_.store(state, std::memory_order_relaxed);
 }
 
 void Heap::PrintShortHeapStatistics() {
@@ -470,8 +464,7 @@ void Heap::PrintShortHeapStatistics() {
                "Read-only space,        used: %6zu KB"
                ", available: %6zu KB"
                ", committed: %6zu KB\n",
-               read_only_space_->Size() / KB,
-               read_only_space_->Available() / KB,
+               read_only_space_->Size() / KB, size_t{0},
                read_only_space_->CommittedMemory() / KB);
   PrintIsolate(isolate_,
                "New space,              used: %6zu KB"
@@ -522,8 +515,8 @@ void Heap::PrintShortHeapStatistics() {
                "All spaces,             used: %6zu KB"
                ", available: %6zu KB"
                ", committed: %6zu KB\n",
-               (this->SizeOfObjects() + ro_space->SizeOfObjects()) / KB,
-               (this->Available() + ro_space->Available()) / KB,
+               (this->SizeOfObjects() + ro_space->Size()) / KB,
+               (this->Available()) / KB,
                (this->CommittedMemory() + ro_space->CommittedMemory()) / KB);
   PrintIsolate(isolate_,
                "Unmapper buffering %zu chunks of committed: %6zu KB\n",
@@ -631,7 +624,8 @@ void Heap::DumpJSONHeapStatistics(std::stringstream& stream) {
     std::stringstream stream;
     stream << DICT(
       MEMBER("name")
-        << ESCAPE(GetSpaceName(static_cast<AllocationSpace>(space_index)))
+        << ESCAPE(BaseSpace::GetSpaceName(
+              static_cast<AllocationSpace>(space_index)))
         << ","
       MEMBER("size") << space_stats.space_size() << ","
       MEMBER("used_size") << space_stats.space_used_size() << ","
@@ -839,7 +833,7 @@ void Heap::GarbageCollectionPrologue() {
   UpdateMaximumCommitted();
 
 #ifdef DEBUG
-  DCHECK(!AllowHeapAllocation::IsAllowed() && gc_state_ == NOT_IN_GC);
+  DCHECK(!AllowHeapAllocation::IsAllowed() && gc_state() == NOT_IN_GC);
 
   if (FLAG_gc_verbose) Print();
 #endif  // DEBUG
@@ -849,14 +843,17 @@ void Heap::GarbageCollectionPrologue() {
   } else {
     maximum_size_scavenges_ = 0;
   }
-  CheckNewSpaceExpansionCriteria();
-  UpdateNewSpaceAllocationCounter();
   if (FLAG_track_retaining_path) {
     retainer_.clear();
     ephemeron_retainer_.clear();
     retaining_root_.clear();
   }
   memory_allocator()->unmapper()->PrepareForGC();
+}
+
+void Heap::GarbageCollectionPrologueInSafepoint() {
+  UpdateNewSpaceAllocationCounter();
+  CheckNewSpaceExpansionCriteria();
 }
 
 size_t Heap::SizeOfObjects() {
@@ -874,29 +871,6 @@ size_t Heap::TotalGlobalHandlesSize() {
 
 size_t Heap::UsedGlobalHandlesSize() {
   return isolate_->global_handles()->UsedSize();
-}
-
-// static
-const char* Heap::GetSpaceName(AllocationSpace space) {
-  switch (space) {
-    case NEW_SPACE:
-      return "new_space";
-    case OLD_SPACE:
-      return "old_space";
-    case MAP_SPACE:
-      return "map_space";
-    case CODE_SPACE:
-      return "code_space";
-    case LO_SPACE:
-      return "large_object_space";
-    case NEW_LO_SPACE:
-      return "new_large_object_space";
-    case CODE_LO_SPACE:
-      return "code_large_object_space";
-    case RO_SPACE:
-      return "read_only_space";
-  }
-  UNREACHABLE();
 }
 
 void Heap::MergeAllocationSitePretenuringFeedback(
@@ -926,6 +900,7 @@ void Heap::MergeAllocationSitePretenuringFeedback(
 void Heap::AddAllocationObserversToAllSpaces(
     AllocationObserver* observer, AllocationObserver* new_space_observer) {
   DCHECK(observer && new_space_observer);
+  SafepointScope scope(this);
 
   for (SpaceIterator it(this); it.HasNext();) {
     Space* space = it.Next();
@@ -940,6 +915,7 @@ void Heap::AddAllocationObserversToAllSpaces(
 void Heap::RemoveAllocationObserversFromAllSpaces(
     AllocationObserver* observer, AllocationObserver* new_space_observer) {
   DCHECK(observer && new_space_observer);
+  SafepointScope scope(this);
 
   for (SpaceIterator it(this); it.HasNext();) {
     Space* space = it.Next();
@@ -1155,6 +1131,11 @@ void Heap::GarbageCollectionEpilogueInSafepoint() {
   if (FLAG_code_stats) ReportCodeStatistics("After GC");
   if (FLAG_check_handle_count) CheckHandleCount();
 #endif
+
+  {
+    TRACE_GC(tracer(), GCTracer::Scope::HEAP_EPILOGUE_REDUCE_NEW_SPACE);
+    ReduceNewSpaceSize();
+  }
 }
 
 void Heap::GarbageCollectionEpilogue() {
@@ -1170,9 +1151,10 @@ void Heap::GarbageCollectionEpilogue() {
   isolate_->counters()->alive_after_last_gc()->Set(
       static_cast<int>(SizeOfObjects()));
 
-  isolate_->counters()->string_table_capacity()->Set(string_table().Capacity());
+  isolate_->counters()->string_table_capacity()->Set(
+      isolate()->string_table()->Capacity());
   isolate_->counters()->number_of_symbols()->Set(
-      string_table().NumberOfElements());
+      isolate()->string_table()->NumberOfElements());
 
   if (CommittedMemory() > 0) {
     isolate_->counters()->external_fragmentation_total()->AddSample(
@@ -1196,11 +1178,6 @@ void Heap::GarbageCollectionEpilogue() {
 #endif  // DEBUG
 
   last_gc_time_ = MonotonicallyIncreasingTimeInMs();
-
-  {
-    TRACE_GC(tracer(), GCTracer::Scope::HEAP_EPILOGUE_REDUCE_NEW_SPACE);
-    ReduceNewSpaceSize();
-  }
 }
 
 class GCCallbacksScope {
@@ -1651,8 +1628,12 @@ bool Heap::CollectGarbage(AllocationSpace space,
     }
 
     if (collector == MARK_COMPACTOR) {
-      size_t committed_memory_after = CommittedOldGenerationMemory();
+      // Calculate used memory first, then committed memory. Following code
+      // assumes that committed >= used, which might not hold when this is
+      // calculated in the wrong order and background threads allocate
+      // in-between.
       size_t used_memory_after = OldGenerationSizeOfObjects();
+      size_t committed_memory_after = CommittedOldGenerationMemory();
       MemoryReducer::Event event;
       event.type = MemoryReducer::kMarkCompact;
       event.time_ms = MonotonicallyIncreasingTimeInMs();
@@ -1681,7 +1662,7 @@ bool Heap::CollectGarbage(AllocationSpace space,
     isolate()->CountUsage(v8::Isolate::kForcedGC);
   }
 
-  collection_barrier_.Increment();
+  collection_barrier_.CollectionPerformed();
 
   // Start incremental marking for the next cycle. We do this only for scavenger
   // to avoid a loop where mark-compact causes another mark-compact.
@@ -1750,10 +1731,12 @@ void Heap::StartIncrementalMarkingIfAllocationLimitIsReachedBackground() {
   }
 
   const size_t old_generation_space_available = OldGenerationSpaceAvailable();
-  const size_t global_memory_available = GlobalMemoryAvailable();
+  const base::Optional<size_t> global_memory_available =
+      GlobalMemoryAvailable();
 
   if (old_generation_space_available < new_space_->Capacity() ||
-      global_memory_available < new_space_->Capacity()) {
+      (global_memory_available &&
+       *global_memory_available < new_space_->Capacity())) {
     incremental_marking()->incremental_marking_job()->ScheduleTask(this);
   }
 }
@@ -1846,41 +1829,25 @@ void Heap::CopyRange(HeapObject dst_object, const TSlot dst_slot,
 
 #ifdef VERIFY_HEAP
 // Helper class for verifying the string table.
-class StringTableVerifier : public ObjectVisitor {
+class StringTableVerifier : public RootVisitor {
  public:
-  explicit StringTableVerifier(Isolate* isolate) : isolate_(isolate) {}
-
-  void VisitPointers(HeapObject host, ObjectSlot start,
-                     ObjectSlot end) override {
+  void VisitRootPointers(Root root, const char* description,
+                         FullObjectSlot start, FullObjectSlot end) override {
     // Visit all HeapObject pointers in [start, end).
-    for (ObjectSlot p = start; p < end; ++p) {
+    for (FullObjectSlot p = start; p < end; ++p) {
       DCHECK(!HasWeakHeapObjectTag(*p));
       if ((*p).IsHeapObject()) {
         HeapObject object = HeapObject::cast(*p);
         // Check that the string is actually internalized.
-        CHECK(object.IsTheHole(isolate_) || object.IsUndefined(isolate_) ||
-              object.IsInternalizedString());
+        CHECK(object.IsInternalizedString());
       }
     }
   }
-  void VisitPointers(HeapObject host, MaybeObjectSlot start,
-                     MaybeObjectSlot end) override {
-    UNREACHABLE();
-  }
-
-  void VisitCodeTarget(Code host, RelocInfo* rinfo) override { UNREACHABLE(); }
-
-  void VisitEmbeddedPointer(Code host, RelocInfo* rinfo) override {
-    UNREACHABLE();
-  }
-
- private:
-  Isolate* isolate_;
 };
 
 static void VerifyStringTable(Isolate* isolate) {
-  StringTableVerifier verifier(isolate);
-  isolate->heap()->string_table().IterateElements(&verifier);
+  StringTableVerifier verifier;
+  isolate->string_table()->IterateElements(&verifier);
 }
 #endif  // VERIFY_HEAP
 
@@ -1954,7 +1921,11 @@ bool Heap::ReserveSpace(Reservation* reservations, std::vector<Address>* maps) {
               AllocateRaw(size, type, AllocationOrigin::kRuntime, align);
 #else
           if (space == NEW_SPACE) {
-            allocation = new_space()->AllocateRawUnaligned(size);
+            allocation = new_space()->AllocateRaw(
+                size, AllocationAlignment::kWordAligned);
+          } else if (space == RO_SPACE) {
+            allocation = read_only_space()->AllocateRaw(
+                size, AllocationAlignment::kWordAligned);
           } else {
             // The deserializer will update the skip list.
             allocation = paged_space(space)->AllocateRawUnaligned(size);
@@ -2013,21 +1984,29 @@ void Heap::EnsureFromSpaceIsCommitted() {
   FatalProcessOutOfMemory("Committing semi space failed.");
 }
 
-void Heap::CollectionBarrier::Increment() {
+void Heap::CollectionBarrier::CollectionPerformed() {
   base::MutexGuard guard(&mutex_);
-  requested_ = false;
+  gc_requested_ = false;
+  cond_.NotifyAll();
+}
+
+void Heap::CollectionBarrier::ShutdownRequested() {
+  base::MutexGuard guard(&mutex_);
+  shutdown_requested_ = true;
   cond_.NotifyAll();
 }
 
 void Heap::CollectionBarrier::Wait() {
   base::MutexGuard guard(&mutex_);
 
-  if (!requested_) {
+  if (shutdown_requested_) return;
+
+  if (!gc_requested_) {
     heap_->MemoryPressureNotification(MemoryPressureLevel::kCritical, false);
-    requested_ = true;
+    gc_requested_ = true;
   }
 
-  while (requested_) {
+  while (gc_requested_ && !shutdown_requested_) {
     cond_.Wait(&mutex_);
   }
 }
@@ -2062,9 +2041,6 @@ size_t Heap::PerformGarbageCollection(
   base::Optional<SafepointScope> optional_safepoint_scope;
   if (FLAG_local_heaps) {
     optional_safepoint_scope.emplace(this);
-    // Fill and reset all LABs
-    safepoint()->IterateLocalHeaps(
-        [](LocalHeap* local_heap) { local_heap->FreeLinearAllocationArea(); });
   }
 #ifdef VERIFY_HEAP
   if (FLAG_verify_heap) {
@@ -2072,6 +2048,8 @@ size_t Heap::PerformGarbageCollection(
   }
 #endif
   tracer()->StartInSafepoint();
+
+  GarbageCollectionPrologueInSafepoint();
 
   EnsureFromSpaceIsCommitted();
 
@@ -3000,10 +2978,12 @@ HeapObject CreateFillerObjectAtImpl(ReadOnlyRoots roots, Address addr, int size,
 
 #ifdef DEBUG
 void VerifyNoNeedToClearSlots(Address start, Address end) {
-  MemoryChunk* chunk = MemoryChunk::FromAddress(start);
+  BasicMemoryChunk* basic_chunk = BasicMemoryChunk::FromAddress(start);
+  if (basic_chunk->InReadOnlySpace()) return;
+  MemoryChunk* chunk = static_cast<MemoryChunk*>(basic_chunk);
   // TODO(ulan): Support verification of large pages.
   if (chunk->InYoungGeneration() || chunk->IsLargePage()) return;
-  Space* space = chunk->owner();
+  BaseSpace* space = chunk->owner();
   if (static_cast<PagedSpace*>(space)->is_off_thread_space()) return;
   space->heap()->VerifySlotRangeHasNoRecordedSlots(start, end);
 }
@@ -3022,6 +3002,13 @@ HeapObject Heap::CreateFillerObjectAt(ReadOnlyRoots roots, Address addr,
       CreateFillerObjectAtImpl(roots, addr, size, clear_memory_mode);
   VerifyNoNeedToClearSlots(addr, addr + size);
   return filler;
+}
+
+void Heap::CreateFillerObjectAtBackground(
+    Address addr, int size, ClearFreedMemoryMode clear_memory_mode) {
+  CreateFillerObjectAtImpl(ReadOnlyRoots(this), addr, size, clear_memory_mode);
+  // Do not verify whether slots are cleared here: the concurrent sweeper is not
+  // allowed to access the main thread's remembered set.
 }
 
 HeapObject Heap::CreateFillerObjectAt(Address addr, int size,
@@ -3059,7 +3046,9 @@ bool Heap::InOffThreadSpace(HeapObject heap_object) {
 #ifdef V8_ENABLE_THIRD_PARTY_HEAP
   return false;  // currently unsupported
 #else
-  Space* owner = MemoryChunk::FromHeapObject(heap_object)->owner();
+  BaseSpace* owner = BasicMemoryChunk::FromHeapObject(heap_object)->owner();
+  // Detached RO_SPACE chunks have no owner set.
+  if (owner == nullptr) return false;
   if (owner->identity() == OLD_SPACE) {
     // TODO(leszeks): Should we exclude compaction spaces here?
     return static_cast<PagedSpace*>(owner)->is_off_thread_space();
@@ -3078,12 +3067,12 @@ bool Heap::IsImmovable(HeapObject object) {
     return true;
   }
 
-  MemoryChunk* chunk = MemoryChunk::FromHeapObject(object);
+  BasicMemoryChunk* chunk = BasicMemoryChunk::FromHeapObject(object);
   return chunk->NeverEvacuate() || IsLargeObject(object);
 }
 
 bool Heap::IsLargeObject(HeapObject object) {
-  return MemoryChunk::FromHeapObject(object)->IsLargePage();
+  return BasicMemoryChunk::FromHeapObject(object)->IsLargePage();
 }
 
 #ifdef ENABLE_SLOW_DCHECKS
@@ -3112,8 +3101,9 @@ class LeftTrimmerVerifierRootVisitor : public RootVisitor {
 namespace {
 bool MayContainRecordedSlots(HeapObject object) {
   // New space object do not have recorded slots.
-  if (MemoryChunk::FromHeapObject(object)->InYoungGeneration()) return false;
-  // Whitelist objects that definitely do not have pointers.
+  if (BasicMemoryChunk::FromHeapObject(object)->InYoungGeneration())
+    return false;
+  // Allowlist objects that definitely do not have pointers.
   if (object.IsByteArray() || object.IsFixedDoubleArray()) return false;
   // Conservatively return true for other objects.
   return true;
@@ -3225,6 +3215,7 @@ FixedArrayBase Heap::LeftTrimFixedArray(FixedArrayBase object,
   if (FLAG_enable_slow_asserts) {
     // Make sure the stack or other roots (e.g., Handles) don't contain pointers
     // to the original FixedArray (which is now the filler object).
+    SafepointScope scope(this);
     LeftTrimmerVerifierRootVisitor root_visitor(object);
     ReadOnlyRoots(this).Iterate(&root_visitor);
     IterateRoots(&root_visitor, {});
@@ -3335,6 +3326,15 @@ void Heap::CreateFillerForArray(T object, int elements_to_trim,
 
 void Heap::MakeHeapIterable() {
   mark_compact_collector()->EnsureSweepingCompleted();
+
+  MakeLocalHeapLabsIterable();
+}
+
+void Heap::MakeLocalHeapLabsIterable() {
+  if (!FLAG_local_heaps) return;
+  safepoint()->IterateLocalHeaps([](LocalHeap* local_heap) {
+    local_heap->MakeLinearAllocationAreaIterable();
+  });
 }
 
 namespace {
@@ -4079,7 +4079,7 @@ const char* Heap::GarbageCollectionReasonToString(
   UNREACHABLE();
 }
 
-bool Heap::Contains(HeapObject value) {
+bool Heap::Contains(HeapObject value) const {
   if (V8_ENABLE_THIRD_PARTY_HEAP_BOOL) {
     return true;
   }
@@ -4096,7 +4096,7 @@ bool Heap::Contains(HeapObject value) {
           new_lo_space_->Contains(value));
 }
 
-bool Heap::InSpace(HeapObject value, AllocationSpace space) {
+bool Heap::InSpace(HeapObject value, AllocationSpace space) const {
   if (memory_allocator()->IsOutsideAllocatedSpace(value.address())) {
     return false;
   }
@@ -4123,7 +4123,7 @@ bool Heap::InSpace(HeapObject value, AllocationSpace space) {
   UNREACHABLE();
 }
 
-bool Heap::InSpaceSlow(Address addr, AllocationSpace space) {
+bool Heap::InSpaceSlow(Address addr, AllocationSpace space) const {
   if (memory_allocator()->IsOutsideAllocatedSpace(addr)) {
     return false;
   }
@@ -4167,31 +4167,12 @@ bool Heap::IsValidAllocationSpace(AllocationSpace space) {
 }
 
 #ifdef VERIFY_HEAP
-class VerifyReadOnlyPointersVisitor : public VerifyPointersVisitor {
- public:
-  explicit VerifyReadOnlyPointersVisitor(Heap* heap)
-      : VerifyPointersVisitor(heap) {}
-
- protected:
-  void VerifyPointers(HeapObject host, MaybeObjectSlot start,
-                      MaybeObjectSlot end) override {
-    if (!host.is_null()) {
-      CHECK(ReadOnlyHeap::Contains(host.map()));
-    }
-    VerifyPointersVisitor::VerifyPointers(host, start, end);
-
-    for (MaybeObjectSlot current = start; current < end; ++current) {
-      HeapObject heap_object;
-      if ((*current)->GetHeapObject(&heap_object)) {
-        CHECK(ReadOnlyHeap::Contains(heap_object));
-      }
-    }
-  }
-};
-
 void Heap::Verify() {
   CHECK(HasBeenSetUp());
+  SafepointScope safepoint_scope(this);
   HandleScope scope(isolate());
+
+  MakeLocalHeapLabsIterable();
 
   // We have to wait here for the sweeper threads to have an iterable heap.
   mark_compact_collector()->EnsureSweepingCompleted();
@@ -4225,8 +4206,7 @@ void Heap::Verify() {
 
 void Heap::VerifyReadOnlyHeap() {
   CHECK(!read_only_space_->writable());
-  VerifyReadOnlyPointersVisitor read_only_visitor(this);
-  read_only_space_->Verify(isolate(), &read_only_visitor);
+  read_only_space_->Verify(isolate());
 }
 
 class SlotVerifyingVisitor : public ObjectVisitor {
@@ -4311,21 +4291,20 @@ class OldToNewSlotVerifyingVisitor : public SlotVerifyingVisitor {
   void VisitEphemeron(HeapObject host, int index, ObjectSlot key,
                       ObjectSlot target) override {
     VisitPointer(host, target);
-    if (FLAG_minor_mc) {
-      VisitPointer(host, target);
-    } else {
-      // Keys are handled separately and should never appear in this set.
-      CHECK(!InUntypedSet(key));
-      Object k = *key;
-      if (!ObjectInYoungGeneration(host) && ObjectInYoungGeneration(k)) {
-        EphemeronHashTable table = EphemeronHashTable::cast(host);
-        auto it = ephemeron_remembered_set_->find(table);
-        CHECK(it != ephemeron_remembered_set_->end());
-        int slot_index =
-            EphemeronHashTable::SlotToIndex(table.address(), key.address());
-        InternalIndex entry = EphemeronHashTable::IndexToEntry(slot_index);
-        CHECK(it->second.find(entry.as_int()) != it->second.end());
-      }
+#ifdef ENABLE_MINOR_MC
+    if (FLAG_minor_mc) return VisitPointer(host, target);
+#endif
+    // Keys are handled separately and should never appear in this set.
+    CHECK(!InUntypedSet(key));
+    Object k = *key;
+    if (!ObjectInYoungGeneration(host) && ObjectInYoungGeneration(k)) {
+      EphemeronHashTable table = EphemeronHashTable::cast(host);
+      auto it = ephemeron_remembered_set_->find(table);
+      CHECK(it != ephemeron_remembered_set_->end());
+      int slot_index =
+          EphemeronHashTable::SlotToIndex(table.address(), key.address());
+      InternalIndex entry = EphemeronHashTable::IndexToEntry(slot_index);
+      CHECK(it->second.find(entry.as_int()) != it->second.end());
     }
   }
 
@@ -4390,12 +4369,7 @@ void Heap::VerifyRememberedSetFor(HeapObject object) {
 
 #ifdef DEBUG
 void Heap::VerifyCountersAfterSweeping() {
-  if (FLAG_local_heaps) {
-    // Ensure heap is iterable
-    safepoint()->IterateLocalHeaps([](LocalHeap* local_heap) {
-      local_heap->MakeLinearAllocationAreaIterable();
-    });
-  }
+  MakeLocalHeapLabsIterable();
 
   PagedSpaceIterator spaces(this);
   for (PagedSpace* space = spaces.Next(); space != nullptr;
@@ -4452,8 +4426,12 @@ void Heap::set_builtin(int index, Code builtin) {
 
 void Heap::IterateWeakRoots(RootVisitor* v, base::EnumSet<SkipRoot> options) {
   DCHECK(!options.contains(SkipRoot::kWeak));
-  v->VisitRootPointer(Root::kStringTable, nullptr,
-                      FullObjectSlot(&roots_table()[RootIndex::kStringTable]));
+
+  if (!options.contains(SkipRoot::kUnserializable)) {
+    // Do not visit for serialization, since the string table is custom
+    // serialized.
+    isolate()->string_table()->IterateElements(v);
+  }
   v->Synchronize(VisitorSynchronization::kStringTable);
   if (!options.contains(SkipRoot::kExternalStringTable) &&
       !options.contains(SkipRoot::kUnserializable)) {
@@ -4599,12 +4577,11 @@ void Heap::IterateRoots(RootVisitor* v, base::EnumSet<SkipRoot> options) {
     if (FLAG_local_heaps) {
       safepoint_->Iterate(&left_trim_visitor);
       safepoint_->Iterate(v);
-      isolate_->persistent_handles_list()->Iterate(&left_trim_visitor);
-      isolate_->persistent_handles_list()->Iterate(v);
     }
 
-    isolate_->IterateDeferredHandles(&left_trim_visitor);
-    isolate_->IterateDeferredHandles(v);
+    isolate_->persistent_handles_list()->Iterate(&left_trim_visitor, isolate_);
+    isolate_->persistent_handles_list()->Iterate(v, isolate_);
+
     v->Synchronize(VisitorSynchronization::kHandleScope);
 
     if (options.contains(SkipRoot::kOldGeneration)) {
@@ -4768,6 +4745,10 @@ void Heap::ConfigureHeap(const v8::ResourceConstraints& constraints) {
         RoundDown<Page::kPageSize>(initial_semispace_size_);
   }
 
+  if (FLAG_lazy_new_space_shrinking) {
+    initial_semispace_size_ = max_semi_space_size_;
+  }
+
   // Initialize initial_old_space_size_.
   {
     initial_old_generation_size_ = kMaxInitialOldGenerationSize;
@@ -4874,6 +4855,7 @@ void Heap::RecordStats(HeapStats* stats, bool take_snapshot) {
   *stats->memory_allocator_capacity =
       memory_allocator()->Size() + memory_allocator()->Available();
   *stats->os_error = base::OS::GetLastError();
+  // TODO(leszeks): Include the string table in both current and peak usage.
   *stats->malloced_memory = isolate_->allocator()->GetCurrentMemoryUsage();
   *stats->malloced_peak_memory = isolate_->allocator()->GetMaxMemoryUsage();
   if (take_snapshot) {
@@ -4897,7 +4879,7 @@ size_t Heap::OldGenerationSizeOfObjects() {
        space = spaces.Next()) {
     total += space->SizeOfObjects();
   }
-  return total + lo_space_->SizeOfObjects();
+  return total + lo_space_->SizeOfObjects() + code_lo_space_->SizeOfObjects();
 }
 
 size_t Heap::GlobalSizeOfObjects() {
@@ -4993,6 +4975,11 @@ bool Heap::IsRetryOfFailedAllocation(LocalHeap* local_heap) {
   return local_heap->allocation_failed_;
 }
 
+void Heap::AlwaysAllocateAfterTearDownStarted() {
+  always_allocate_scope_count_++;
+  collection_barrier_.ShutdownRequested();
+}
+
 Heap::HeapGrowingMode Heap::CurrentHeapGrowingMode() {
   if (ShouldReduceMemory() || FLAG_stress_compaction) {
     return Heap::HeapGrowingMode::kMinimal;
@@ -5009,12 +4996,15 @@ Heap::HeapGrowingMode Heap::CurrentHeapGrowingMode() {
   return Heap::HeapGrowingMode::kDefault;
 }
 
-size_t Heap::GlobalMemoryAvailable() {
-  return UseGlobalMemoryScheduling()
-             ? GlobalSizeOfObjects() < global_allocation_limit_
-                   ? global_allocation_limit_ - GlobalSizeOfObjects()
-                   : 0
-             : new_space_->Capacity() + 1;
+base::Optional<size_t> Heap::GlobalMemoryAvailable() {
+  if (!UseGlobalMemoryScheduling()) return {};
+
+  size_t global_size = GlobalSizeOfObjects();
+
+  if (global_size < global_allocation_limit_)
+    return global_allocation_limit_ - global_size;
+
+  return 0;
 }
 
 double Heap::PercentToOldGenerationLimit() {
@@ -5097,10 +5087,12 @@ Heap::IncrementalMarkingLimit Heap::IncrementalMarkingLimitReached() {
   }
 
   size_t old_generation_space_available = OldGenerationSpaceAvailable();
-  const size_t global_memory_available = GlobalMemoryAvailable();
+  const base::Optional<size_t> global_memory_available =
+      GlobalMemoryAvailable();
 
   if (old_generation_space_available > new_space_->Capacity() &&
-      (global_memory_available > new_space_->Capacity())) {
+      (!global_memory_available ||
+       global_memory_available > new_space_->Capacity())) {
     return IncrementalMarkingLimit::kNoLimit;
   }
   if (ShouldOptimizeForMemoryUsage()) {
@@ -5112,7 +5104,7 @@ Heap::IncrementalMarkingLimit Heap::IncrementalMarkingLimitReached() {
   if (old_generation_space_available == 0) {
     return IncrementalMarkingLimit::kHardLimit;
   }
-  if (global_memory_available == 0) {
+  if (global_memory_available && *global_memory_available == 0) {
     return IncrementalMarkingLimit::kHardLimit;
   }
   return IncrementalMarkingLimit::kSoftLimit;
@@ -5123,6 +5115,7 @@ void Heap::EnableInlineAllocation() {
   inline_allocation_disabled_ = false;
 
   // Update inline allocation limit for new space.
+  new_space()->AdvanceAllocationObservers();
   new_space()->UpdateInlineAllocationLimit(0);
 }
 
@@ -5155,7 +5148,7 @@ HeapObject Heap::EnsureImmovableCode(HeapObject heap_object, int object_size) {
   if (!Heap::IsImmovable(heap_object)) {
     if (isolate()->serializer_enabled() ||
         code_space_->first_page()->Contains(heap_object.address())) {
-      MemoryChunk::FromHeapObject(heap_object)->MarkNeverEvacuate();
+      BasicMemoryChunk::FromHeapObject(heap_object)->MarkNeverEvacuate();
     } else {
       // Discard the first code allocation, which was on a page where it could
       // be moved.
@@ -5289,6 +5282,9 @@ void Heap::SetUp() {
     concurrent_marking_.reset(new ConcurrentMarking(this, nullptr, nullptr));
   }
 
+  marking_barrier_.reset(new MarkingBarrier(this, mark_compact_collector(),
+                                            incremental_marking()));
+
   for (int i = FIRST_SPACE; i <= LAST_SPACE; i++) {
     space_[i] = nullptr;
   }
@@ -5298,13 +5294,18 @@ void Heap::SetUpFromReadOnlyHeap(ReadOnlyHeap* ro_heap) {
   DCHECK_NOT_NULL(ro_heap);
   DCHECK_IMPLIES(read_only_space_ != nullptr,
                  read_only_space_ == ro_heap->read_only_space());
-  space_[RO_SPACE] = read_only_space_ = ro_heap->read_only_space();
+  space_[RO_SPACE] = nullptr;
+  read_only_space_ = ro_heap->read_only_space();
 }
 
 void Heap::ReplaceReadOnlySpace(SharedReadOnlySpace* space) {
   CHECK(V8_SHARED_RO_HEAP_BOOL);
-  delete read_only_space_;
-  space_[RO_SPACE] = read_only_space_ = space;
+  if (read_only_space_) {
+    read_only_space_->TearDown(memory_allocator());
+    delete read_only_space_;
+  }
+
+  read_only_space_ = space;
 }
 
 void Heap::SetUpSpaces() {
@@ -5432,6 +5433,10 @@ void Heap::NotifyDeserializationComplete() {
 #endif  // DEBUG
   }
 
+  if (FLAG_stress_concurrent_allocation) {
+    StressConcurrentAllocatorTask::Schedule(isolate());
+  }
+
   deserialization_complete_ = true;
 }
 
@@ -5443,7 +5448,15 @@ void Heap::NotifyBootstrapComplete() {
   }
 }
 
-void Heap::NotifyOldGenerationExpansion() {
+void Heap::NotifyOldGenerationExpansion(AllocationSpace space,
+                                        MemoryChunk* chunk) {
+  // Pages created during bootstrapping may contain immortal immovable objects.
+  if (!deserialization_complete()) {
+    chunk->MarkNeverEvacuate();
+  }
+  if (space == CODE_SPACE || space == CODE_LO_SPACE) {
+    isolate()->AddCodeMemoryChunk(chunk);
+  }
   const size_t kMemoryReducerActivationThreshold = 1 * MB;
   if (old_generation_capacity_after_bootstrap_ && ms_count_ == 0 &&
       OldGenerationCapacity() >= old_generation_capacity_after_bootstrap_ +
@@ -5457,7 +5470,7 @@ void Heap::NotifyOldGenerationExpansion() {
 }
 
 void Heap::SetEmbedderHeapTracer(EmbedderHeapTracer* tracer) {
-  DCHECK_EQ(gc_state_, HeapState::NOT_IN_GC);
+  DCHECK_EQ(gc_state(), HeapState::NOT_IN_GC);
   local_embedder_heap_tracer()->SetRemoteTracer(tracer);
 }
 
@@ -5494,6 +5507,14 @@ void Heap::RegisterExternallyReferencedObject(Address* location) {
 
 void Heap::StartTearDown() {
   SetGCState(TEAR_DOWN);
+
+  // Background threads may allocate and block until GC is performed. However
+  // this might never happen when the main thread tries to quit and doesn't
+  // process the event queue anymore. Avoid this deadlock by allowing all
+  // allocations after tear down was requested to make sure all background
+  // threads finish.
+  AlwaysAllocateAfterTearDownStarted();
+
 #ifdef VERIFY_HEAP
   // {StartTearDown} is called fairly early during Isolate teardown, so it's
   // a good time to run heap verification (if requested), before starting to
@@ -5506,7 +5527,7 @@ void Heap::StartTearDown() {
 }
 
 void Heap::TearDown() {
-  DCHECK_EQ(gc_state_, TEAR_DOWN);
+  DCHECK_EQ(gc_state(), TEAR_DOWN);
 
   // It's too late for Heap::Verify() here, as parts of the Isolate are
   // already gone by the time this is called.
@@ -5584,12 +5605,13 @@ void Heap::TearDown() {
 
   tracer_.reset();
 
-  isolate()->read_only_heap()->OnHeapTearDown();
-  space_[RO_SPACE] = read_only_space_ = nullptr;
   for (int i = FIRST_MUTABLE_SPACE; i <= LAST_MUTABLE_SPACE; i++) {
     delete space_[i];
     space_[i] = nullptr;
   }
+
+  isolate()->read_only_heap()->OnHeapTearDown(this);
+  read_only_space_ = nullptr;
 
   memory_allocator()->TearDown();
 
@@ -5919,14 +5941,14 @@ class UnreachableObjectsFilter : public HeapObjectsFilter {
 
   bool SkipObject(HeapObject object) override {
     if (object.IsFreeSpaceOrFiller()) return true;
-    MemoryChunk* chunk = MemoryChunk::FromHeapObject(object);
+    BasicMemoryChunk* chunk = BasicMemoryChunk::FromHeapObject(object);
     if (reachable_.count(chunk) == 0) return true;
     return reachable_[chunk]->count(object) == 0;
   }
 
  private:
   bool MarkAsReachable(HeapObject object) {
-    MemoryChunk* chunk = MemoryChunk::FromHeapObject(object);
+    BasicMemoryChunk* chunk = BasicMemoryChunk::FromHeapObject(object);
     if (reachable_.count(chunk) == 0) {
       reachable_[chunk] = new std::unordered_set<HeapObject, Object::Hasher>();
     }
@@ -6008,7 +6030,7 @@ class UnreachableObjectsFilter : public HeapObjectsFilter {
 
   Heap* heap_;
   DisallowHeapAllocation no_allocation_;
-  std::unordered_map<MemoryChunk*,
+  std::unordered_map<BasicMemoryChunk*,
                      std::unordered_set<HeapObject, Object::Hasher>*>
       reachable_;
 };
@@ -6016,6 +6038,7 @@ class UnreachableObjectsFilter : public HeapObjectsFilter {
 HeapObjectIterator::HeapObjectIterator(
     Heap* heap, HeapObjectIterator::HeapObjectsFiltering filtering)
     : heap_(heap),
+      safepoint_scope_(std::make_unique<SafepointScope>(heap)),
       filtering_(filtering),
       filter_(nullptr),
       space_iterator_(nullptr),
@@ -6510,18 +6533,6 @@ void Heap::CreateObjectStats() {
   }
 }
 
-void AllocationObserver::AllocationStep(int bytes_allocated,
-                                        Address soon_object, size_t size) {
-  DCHECK_GE(bytes_allocated, 0);
-  bytes_to_next_step_ -= bytes_allocated;
-  if (bytes_to_next_step_ <= 0) {
-    Step(static_cast<int>(step_size_ - bytes_to_next_step_), soon_object, size);
-    step_size_ = GetNextStepSize();
-    bytes_to_next_step_ = step_size_;
-  }
-  DCHECK_GE(bytes_to_next_step_, 0);
-}
-
 Map Heap::GcSafeMapOfCodeSpaceObject(HeapObject object) {
   MapWord map_word = object.map_word();
   return map_word.IsForwardingAddress() ? map_word.ToForwardingAddress().map()
@@ -6596,18 +6607,8 @@ void Heap::WriteBarrierForCodeSlow(Code code) {
   for (RelocIterator it(code, RelocInfo::EmbeddedObjectModeMask()); !it.done();
        it.next()) {
     GenerationalBarrierForCode(code, it.rinfo(), it.rinfo()->target_object());
-    MarkingBarrierForCode(code, it.rinfo(), it.rinfo()->target_object());
+    WriteBarrier::Marking(code, it.rinfo(), it.rinfo()->target_object());
   }
-}
-
-void Heap::MarkingBarrierForArrayBufferExtensionSlow(
-    HeapObject object, ArrayBufferExtension* extension) {
-  if (V8_CONCURRENT_MARKING_BOOL || GetIsolateFromWritableObject(object)
-                                        ->heap()
-                                        ->incremental_marking()
-                                        ->marking_state()
-                                        ->IsBlack(object))
-    extension->Mark();
 }
 
 void Heap::GenerationalBarrierSlow(HeapObject object, Address slot,
@@ -6636,8 +6637,7 @@ void Heap::EphemeronKeyWriteBarrierFromCode(Address raw_object,
   if (!ObjectInYoungGeneration(table) && ObjectInYoungGeneration(key)) {
     isolate->heap()->RecordEphemeronKeyWrite(table, key_slot_address);
   }
-  isolate->heap()->incremental_marking()->RecordWrite(table, key_slot,
-                                                      maybe_key);
+  WriteBarrier::Marking(table, key_slot, maybe_key);
 }
 
 enum RangeWriteBarrierMode {
@@ -6655,7 +6655,7 @@ void Heap::WriteBarrierForRangeImpl(MemoryChunk* source_page, HeapObject object,
   STATIC_ASSERT(!(kModeMask & kDoEvacuationSlotRecording) ||
                 (kModeMask & kDoMarking));
 
-  IncrementalMarking* incremental_marking = this->incremental_marking();
+  MarkingBarrier* marking_barrier = this->marking_barrier();
   MarkCompactCollector* collector = this->mark_compact_collector();
 
   for (TSlot slot = start_slot; slot < end_slot; ++slot) {
@@ -6670,7 +6670,7 @@ void Heap::WriteBarrierForRangeImpl(MemoryChunk* source_page, HeapObject object,
     }
 
     if ((kModeMask & kDoMarking) &&
-        incremental_marking->BaseRecordWrite(object, value_heap_object)) {
+        marking_barrier->MarkValue(object, value_heap_object)) {
       if (kModeMask & kDoEvacuationSlotRecording) {
         collector->RecordSlot(source_page, HeapObjectSlot(slot),
                               value_heap_object);
@@ -6761,40 +6761,11 @@ void Heap::GenerationalBarrierForCodeSlow(Code host, RelocInfo* rinfo,
                                          static_cast<uint32_t>(offset));
 }
 
-void Heap::MarkingBarrierSlow(HeapObject object, Address slot,
-                              HeapObject value) {
-  Heap* heap = Heap::FromWritableHeapObject(object);
-  heap->incremental_marking()->RecordWriteSlow(object, HeapObjectSlot(slot),
-                                               value);
-}
-
-void Heap::MarkingBarrierForCodeSlow(Code host, RelocInfo* rinfo,
-                                     HeapObject object) {
-  Heap* heap = Heap::FromWritableHeapObject(host);
-  DCHECK(heap->incremental_marking()->IsMarking());
-  heap->incremental_marking()->RecordWriteIntoCode(host, rinfo, object);
-}
-
-void Heap::MarkingBarrierForDescriptorArraySlow(Heap* heap, HeapObject host,
-                                                HeapObject raw_descriptor_array,
-                                                int number_of_own_descriptors) {
-  DCHECK(heap->incremental_marking()->IsMarking());
-  DescriptorArray descriptor_array =
-      DescriptorArray::cast(raw_descriptor_array);
-  int16_t raw_marked = descriptor_array.raw_number_of_marked_descriptors();
-  if (NumberOfMarkedDescriptors::decode(heap->mark_compact_collector()->epoch(),
-                                        raw_marked) <
-      number_of_own_descriptors) {
-    heap->mark_compact_collector()->MarkDescriptorArrayFromWriteBarrier(
-        host, descriptor_array, number_of_own_descriptors);
-  }
-}
-
 bool Heap::PageFlagsAreConsistent(HeapObject object) {
   if (V8_ENABLE_THIRD_PARTY_HEAP_BOOL) {
     return true;
   }
-  MemoryChunk* chunk = MemoryChunk::FromHeapObject(object);
+  BasicMemoryChunk* chunk = BasicMemoryChunk::FromHeapObject(object);
   heap_internals::MemoryChunk* slim_chunk =
       heap_internals::MemoryChunk::FromHeapObject(object);
 
@@ -6803,7 +6774,7 @@ bool Heap::PageFlagsAreConsistent(HeapObject object) {
   CHECK_EQ(chunk->IsFlagSet(MemoryChunk::INCREMENTAL_MARKING),
            slim_chunk->IsMarking());
 
-  AllocationSpace identity = chunk->owner_identity();
+  AllocationSpace identity = chunk->owner()->identity();
 
   // Generation consistency.
   CHECK_EQ(identity == NEW_SPACE || identity == NEW_LO_SPACE,

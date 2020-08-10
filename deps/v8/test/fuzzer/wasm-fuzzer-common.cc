@@ -89,12 +89,17 @@ const char* ValueTypeToConstantName(ValueType type) {
       return "kWasmF32";
     case ValueType::kF64:
       return "kWasmF64";
-    case ValueType::kAnyRef:
-      return "kWasmAnyRef";
-    case ValueType::kFuncRef:
-      return "kWasmFuncRef";
-    case ValueType::kExnRef:
-      return "kWasmExnRef";
+    case ValueType::kOptRef:
+      switch (type.heap_representation()) {
+        case HeapType::kExtern:
+          return "kWasmExternRef";
+        case HeapType::kFunc:
+          return "kWasmFuncRef";
+        case HeapType::kExn:
+          return "kWasmExnRef";
+        default:
+          UNREACHABLE();
+      }
     default:
       UNREACHABLE();
   }
@@ -199,12 +204,12 @@ void GenerateTestCase(Isolate* isolate, ModuleWireBytes wire_bytes,
   for (const WasmElemSegment& elem_segment : module->elem_segments) {
     os << "builder.addElementSegment(";
     os << elem_segment.table_index << ", ";
-    switch (elem_segment.offset.kind) {
-      case WasmInitExpr::kGlobalIndex:
-        os << elem_segment.offset.val.global_index << ", true";
+    switch (elem_segment.offset.kind()) {
+      case WasmInitExpr::kGlobalGet:
+        os << elem_segment.offset.immediate().index << ", true";
         break;
       case WasmInitExpr::kI32Const:
-        os << elem_segment.offset.val.i32_const << ", false";
+        os << elem_segment.offset.immediate().i32_const << ", false";
         break;
       default:
         UNREACHABLE();
@@ -232,7 +237,7 @@ void GenerateTestCase(Isolate* isolate, ModuleWireBytes wire_bytes,
         ValueType type = decls.type_list[pos];
         while (pos + count < locals && decls.type_list[pos + count] == type)
           ++count;
-        os << ".addLocals({" << type.type_name() << "_count: " << count << "})";
+        os << ".addLocals({" << type.name() << "_count: " << count << "})";
       }
       os << "\n";
     }
@@ -272,6 +277,10 @@ void WasmExecutionFuzzer::FuzzWasmModule(Vector<const uint8_t> data,
 #undef ENABLE_STAGED_FEATURES
   // SIMD is not included in staging yet, so we enable it here for fuzzing.
   EXPERIMENTAL_FLAG_SCOPE(simd);
+  // TODO(v8:10308): Bitmask was merged into proposal after 84 cut, so it was
+  // left gated by this flag. In order to fuzz it, we need this flag. This
+  // should be removed once we move bitmask out of post mvp.
+  FLAG_SCOPE(wasm_simd_post_mvp);
 
   // Strictly enforce the input size limit. Note that setting "max_len" on the
   // fuzzer target is not enough, since different fuzzers are used and not all

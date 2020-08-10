@@ -86,6 +86,10 @@ class V8_EXPORT_PRIVATE OffThreadIsolate final
   OffThreadHeap* heap() { return &heap_; }
 
   inline Address isolate_root() const;
+  inline ReadOnlyHeap* read_only_heap();
+  inline Object root(RootIndex index);
+
+  const Isolate* GetIsolateForPtrCompr() const { return isolate_; }
 
   v8::internal::OffThreadFactory* factory() {
     // Upcast to the privately inherited base-class using c-style casts to avoid
@@ -117,9 +121,7 @@ class V8_EXPORT_PRIVATE OffThreadIsolate final
 
   Address* NewHandle(Address object) {
     DCHECK_NOT_NULL(handle_zone_);
-    Address* location =
-        static_cast<Address*>(handle_zone_->New(sizeof(Address)));
-    *location = object;
+    Address* location = handle_zone_->New<Address>(object);
     return location;
   }
 
@@ -129,7 +131,7 @@ class V8_EXPORT_PRIVATE OffThreadIsolate final
     if (handle.is_null()) {
       return OffThreadTransferHandle<T>();
     }
-    return OffThreadTransferHandle<T>(AddTransferHandleStorage(handle));
+    return OffThreadTransferHandle<T>(heap()->AddTransferHandleStorage(handle));
   }
 
   template <typename T>
@@ -139,7 +141,8 @@ class V8_EXPORT_PRIVATE OffThreadIsolate final
     if (!maybe_handle.ToHandle(&handle)) {
       return OffThreadTransferMaybeHandle<T>();
     }
-    return OffThreadTransferMaybeHandle<T>(AddTransferHandleStorage(handle));
+    return OffThreadTransferMaybeHandle<T>(
+        heap()->AddTransferHandleStorage(handle));
   }
 
   int GetNextScriptId();
@@ -157,8 +160,6 @@ class V8_EXPORT_PRIVATE OffThreadIsolate final
  private:
   friend class v8::internal::OffThreadFactory;
 
-  OffThreadTransferHandleStorage* AddTransferHandleStorage(HandleBase handle);
-
   OffThreadHeap heap_;
 
   // TODO(leszeks): Extract out the fields of the Isolate we want and store
@@ -168,8 +169,6 @@ class V8_EXPORT_PRIVATE OffThreadIsolate final
   std::unique_ptr<OffThreadLogger> logger_;
   ThreadId thread_id_;
   Zone* handle_zone_;
-  std::unique_ptr<OffThreadTransferHandleStorage>
-      off_thread_transfer_handles_head_;
 };
 
 }  // namespace internal

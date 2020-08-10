@@ -10,6 +10,7 @@
 
 #include "src/api/api-inl.h"
 #include "src/base/platform/platform.h"
+#include "src/builtins/profile-data-reader.h"
 #include "src/codegen/bailout-reason.h"
 #include "src/codegen/macro-assembler.h"
 #include "src/codegen/source-position-table.h"
@@ -34,10 +35,9 @@
 #include "src/strings/unicode-inl.h"
 #include "src/tracing/tracing-category-observer.h"
 #include "src/utils/memcopy.h"
+#include "src/utils/version.h"
 #include "src/wasm/wasm-code-manager.h"
 #include "src/wasm/wasm-objects-inl.h"
-
-#include "src/utils/version.h"
 
 namespace v8 {
 namespace internal {
@@ -75,9 +75,10 @@ static v8::CodeEventType GetCodeEventTypeForTag(
 
 static const char* ComputeMarker(SharedFunctionInfo shared, AbstractCode code) {
   switch (code.kind()) {
-    case AbstractCode::INTERPRETED_FUNCTION:
+    case CodeKind::INTERPRETED_FUNCTION:
       return shared.optimization_disabled() ? "" : "~";
-    case AbstractCode::OPTIMIZED_FUNCTION:
+    case CodeKind::OPTIMIZED_FUNCTION:
+    case CodeKind::NATIVE_CONTEXT_INDEPENDENT:
       return "*";
     default:
       return "";
@@ -325,9 +326,7 @@ void PerfBasicLogger::LogRecordedBuffer(Handle<AbstractCode> code,
                                         MaybeHandle<SharedFunctionInfo>,
                                         const char* name, int length) {
   if (FLAG_perf_basic_prof_only_functions &&
-      (code->kind() != AbstractCode::INTERPRETED_FUNCTION &&
-       code->kind() != AbstractCode::BUILTIN &&
-       code->kind() != AbstractCode::OPTIMIZED_FUNCTION)) {
+      CodeKindIsBuiltinOrJSFunction(code->kind())) {
     return;
   }
 
@@ -1072,6 +1071,23 @@ void Logger::TimerEvent(Logger::StartEnd se, const char* name) {
   msg.WriteToLogFile();
 }
 
+void Logger::BasicBlockCounterEvent(const char* name, int block_id,
+                                    uint32_t count) {
+  if (!log_->IsEnabled() || !FLAG_turbo_profiling_log_builtins) return;
+  Log::MessageBuilder msg(log_.get());
+  msg << ProfileDataFromFileConstants::kBlockCounterMarker << kNext << name
+      << kNext << block_id << kNext << count;
+  msg.WriteToLogFile();
+}
+
+void Logger::BuiltinHashEvent(const char* name, int hash) {
+  if (!log_->IsEnabled() || !FLAG_turbo_profiling_log_builtins) return;
+  Log::MessageBuilder msg(log_.get());
+  msg << ProfileDataFromFileConstants::kBuiltinHashMarker << kNext << name
+      << kNext << hash;
+  msg.WriteToLogFile();
+}
+
 bool Logger::is_logging() {
   // Disable logging while the CPU profiler is running.
   if (isolate_->is_profiling()) return false;
@@ -1137,11 +1153,12 @@ namespace {
 
 void AppendCodeCreateHeader(
     Log::MessageBuilder& msg,  // NOLINT(runtime/references)
-    CodeEventListener::LogEventsAndTags tag, AbstractCode::Kind kind,
-    uint8_t* address, int size, base::ElapsedTimer* timer) {
+    CodeEventListener::LogEventsAndTags tag, CodeKind kind, uint8_t* address,
+    int size, base::ElapsedTimer* timer) {
   msg << kLogEventsNames[CodeEventListener::CODE_CREATION_EVENT]
-      << Logger::kNext << kLogEventsNames[tag] << Logger::kNext << kind
-      << Logger::kNext << timer->Elapsed().InMicroseconds() << Logger::kNext
+      << Logger::kNext << kLogEventsNames[tag] << Logger::kNext
+      << static_cast<int>(kind) << Logger::kNext
+      << timer->Elapsed().InMicroseconds() << Logger::kNext
       << reinterpret_cast<void*>(address) << Logger::kNext << size
       << Logger::kNext;
 }
@@ -1298,7 +1315,7 @@ void Logger::CodeCreateEvent(LogEventsAndTags tag, const wasm::WasmCode* code,
   if (!is_listening_to_code_events()) return;
   if (!FLAG_log_code || !log_->IsEnabled()) return;
   Log::MessageBuilder msg(log_.get());
-  AppendCodeCreateHeader(msg, tag, AbstractCode::Kind::WASM_FUNCTION,
+  AppendCodeCreateHeader(msg, tag, CodeKind::WASM_FUNCTION,
                          code->instructions().begin(),
                          code->instructions().length(), &timer_);
   DCHECK(!name.empty());
@@ -1377,31 +1394,44 @@ void Logger::CodeDisableOptEvent(Handle<AbstractCode> code,
   msg.WriteToLogFile();
 }
 
-void Logger::CodeDeoptEvent(Handle<Code> code, DeoptimizeKind kind, Address pc,
-                            int fp_to_sp_delta) {
-  if (!log_->IsEnabled()) return;
-  Deoptimizer::DeoptInfo info = Deoptimizer::GetDeoptInfo(*code, pc);
+void Logger::ProcessDeoptEvent(Handle<Code> code, SourcePosition position,
+                               const char* kind, const char* reason) {
   Log::MessageBuilder msg(log_.get());
   msg << "code-deopt" << kNext << timer_.Elapsed().InMicroseconds() << kNext
       << code->CodeSize() << kNext
       << reinterpret_cast<void*>(code->InstructionStart());
 
-  // Deoptimization position.
   std::ostringstream deopt_location;
   int inlining_id = -1;
   int script_offset = -1;
-  if (info.position.IsKnown()) {
-    info.position.Print(deopt_location, *code);
-    inlining_id = info.position.InliningId();
-    script_offset = info.position.ScriptOffset();
+  if (position.IsKnown()) {
+    position.Print(deopt_location, *code);
+    inlining_id = position.InliningId();
+    script_offset = position.ScriptOffset();
   } else {
     deopt_location << "<unknown>";
   }
   msg << kNext << inlining_id << kNext << script_offset << kNext;
-  msg << Deoptimizer::MessageFor(kind) << kNext;
-  msg << deopt_location.str().c_str() << kNext
-      << DeoptimizeReasonToString(info.deopt_reason);
+  msg << kind << kNext;
+  msg << deopt_location.str().c_str() << kNext << reason;
   msg.WriteToLogFile();
+}
+
+void Logger::CodeDeoptEvent(Handle<Code> code, DeoptimizeKind kind, Address pc,
+                            int fp_to_sp_delta, bool reuse_code) {
+  if (!log_->IsEnabled()) return;
+  Deoptimizer::DeoptInfo info = Deoptimizer::GetDeoptInfo(*code, pc);
+  ProcessDeoptEvent(code, info.position,
+                    Deoptimizer::MessageFor(kind, reuse_code),
+                    DeoptimizeReasonToString(info.deopt_reason));
+}
+
+void Logger::CodeDependencyChangeEvent(Handle<Code> code,
+                                       Handle<SharedFunctionInfo> sfi,
+                                       const char* reason) {
+  if (!log_->IsEnabled()) return;
+  SourcePosition position(sfi->StartPosition(), -1);
+  ProcessDeoptEvent(code, position, "dependency-change", reason);
 }
 
 namespace {
@@ -1646,8 +1676,9 @@ void Logger::ICEvent(const char* type, bool keyed, Handle<Map> map,
   int line;
   int column;
   Address pc = isolate_->GetAbstractPC(&line, &column);
-  msg << type << kNext << reinterpret_cast<void*>(pc) << kNext << line << kNext
-      << column << kNext << old_state << kNext << new_state << kNext
+  msg << type << kNext << reinterpret_cast<void*>(pc) << kNext
+      << timer_.Elapsed().InMicroseconds() << kNext << line << kNext << column
+      << kNext << old_state << kNext << new_state << kNext
       << AsHex::Address(map.is_null() ? kNullAddress : map->ptr()) << kNext;
   if (key->IsSmi()) {
     msg << Smi::ToInt(*key);
@@ -2025,20 +2056,21 @@ void ExistingCodeLogger::LogCodeObject(Object object) {
   CodeEventListener::LogEventsAndTags tag = CodeEventListener::STUB_TAG;
   const char* description = "Unknown code from before profiling";
   switch (abstract_code->kind()) {
-    case AbstractCode::INTERPRETED_FUNCTION:
-    case AbstractCode::OPTIMIZED_FUNCTION:
+    case CodeKind::INTERPRETED_FUNCTION:
+    case CodeKind::OPTIMIZED_FUNCTION:
+    case CodeKind::NATIVE_CONTEXT_INDEPENDENT:
       return;  // We log this later using LogCompiledFunctions.
-    case AbstractCode::BYTECODE_HANDLER:
+    case CodeKind::BYTECODE_HANDLER:
       return;  // We log it later by walking the dispatch table.
-    case AbstractCode::STUB:
+    case CodeKind::STUB:
       description = "STUB code";
       tag = CodeEventListener::STUB_TAG;
       break;
-    case AbstractCode::REGEXP:
+    case CodeKind::REGEXP:
       description = "Regular expression code";
       tag = CodeEventListener::REG_EXP_TAG;
       break;
-    case AbstractCode::BUILTIN:
+    case CodeKind::BUILTIN:
       if (Code::cast(object).is_interpreter_trampoline_builtin() &&
           Code::cast(object) !=
               *BUILTIN_CODE(isolate_, InterpreterEntryTrampoline)) {
@@ -2048,32 +2080,30 @@ void ExistingCodeLogger::LogCodeObject(Object object) {
           isolate_->builtins()->name(abstract_code->GetCode().builtin_index());
       tag = CodeEventListener::BUILTIN_TAG;
       break;
-    case AbstractCode::WASM_FUNCTION:
+    case CodeKind::WASM_FUNCTION:
       description = "A Wasm function";
       tag = CodeEventListener::FUNCTION_TAG;
       break;
-    case AbstractCode::JS_TO_WASM_FUNCTION:
+    case CodeKind::JS_TO_WASM_FUNCTION:
       description = "A JavaScript to Wasm adapter";
       tag = CodeEventListener::STUB_TAG;
       break;
-    case AbstractCode::JS_TO_JS_FUNCTION:
+    case CodeKind::JS_TO_JS_FUNCTION:
       description = "A WebAssembly.Function adapter";
       tag = CodeEventListener::STUB_TAG;
       break;
-    case AbstractCode::WASM_TO_CAPI_FUNCTION:
+    case CodeKind::WASM_TO_CAPI_FUNCTION:
       description = "A Wasm to C-API adapter";
       tag = CodeEventListener::STUB_TAG;
       break;
-    case AbstractCode::WASM_TO_JS_FUNCTION:
+    case CodeKind::WASM_TO_JS_FUNCTION:
       description = "A Wasm to JavaScript adapter";
       tag = CodeEventListener::STUB_TAG;
       break;
-    case AbstractCode::C_WASM_ENTRY:
+    case CodeKind::C_WASM_ENTRY:
       description = "A C to Wasm entry stub";
       tag = CodeEventListener::STUB_TAG;
       break;
-    case AbstractCode::NUMBER_OF_KINDS:
-      UNIMPLEMENTED();
   }
   CALL_CODE_EVENT_HANDLER(CodeCreateEvent(tag, abstract_code, description))
 }

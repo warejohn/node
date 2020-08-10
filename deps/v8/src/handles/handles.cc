@@ -35,13 +35,25 @@ bool HandleBase::IsDereferenceAllowed() const {
   HeapObject heap_object = HeapObject::cast(object);
   if (IsReadOnlyHeapObject(heap_object)) return true;
   if (Heap::InOffThreadSpace(heap_object)) return true;
-
   Isolate* isolate = GetIsolateFromWritableObject(heap_object);
   RootIndex root_index;
   if (isolate->roots_table().IsRootHandleLocation(location_, &root_index) &&
       RootsTable::IsImmortalImmovable(root_index)) {
     return true;
   }
+
+  LocalHeap* local_heap = LocalHeap::Current();
+  if (V8_UNLIKELY(local_heap)) {
+    // Local heap can't access handles when parked
+    if (!local_heap->IsHandleDereferenceAllowed()) return false;
+
+    if (local_heap->ContainsPersistentHandle(location_) ||
+        local_heap->ContainsLocalHandle(location_)) {
+      // The current thread owns the handle and thus can dereference it.
+      return true;
+    }
+  }
+
   return AllowHandleDereference::IsAllowed();
 }
 #endif
@@ -155,46 +167,6 @@ Address* CanonicalHandleScope::Lookup(Address object) {
     *entry = HandleScope::CreateHandle(isolate_, object);
   }
   return *entry;
-}
-
-DeferredHandleScope::DeferredHandleScope(Isolate* isolate)
-    : impl_(isolate->handle_scope_implementer()) {
-  impl_->BeginDeferredScope();
-  HandleScopeData* data = impl_->isolate()->handle_scope_data();
-  Address* new_next = impl_->GetSpareOrNewBlock();
-  Address* new_limit = &new_next[kHandleBlockSize];
-  // Check that at least one HandleScope with at least one Handle in it exists,
-  // see the class description.
-  DCHECK(!impl_->blocks()->empty());
-  // Check that we are not in a SealedHandleScope.
-  DCHECK(data->limit == &impl_->blocks()->back()[kHandleBlockSize]);
-  impl_->blocks()->push_back(new_next);
-
-#ifdef DEBUG
-  prev_level_ = data->level;
-#endif
-  data->level++;
-  prev_limit_ = data->limit;
-  prev_next_ = data->next;
-  data->next = new_next;
-  data->limit = new_limit;
-}
-
-DeferredHandleScope::~DeferredHandleScope() {
-  DCHECK(handles_detached_);
-  impl_->isolate()->handle_scope_data()->level--;
-  DCHECK_EQ(impl_->isolate()->handle_scope_data()->level, prev_level_);
-}
-
-std::unique_ptr<DeferredHandles> DeferredHandleScope::Detach() {
-  std::unique_ptr<DeferredHandles> deferred = impl_->Detach(prev_limit_);
-  HandleScopeData* data = impl_->isolate()->handle_scope_data();
-  data->next = prev_next_;
-  data->limit = prev_limit_;
-#ifdef DEBUG
-  handles_detached_ = true;
-#endif
-  return deferred;
 }
 
 }  // namespace internal

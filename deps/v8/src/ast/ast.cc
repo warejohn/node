@@ -335,10 +335,9 @@ void ObjectLiteral::CalculateEmitStore(Zone* zone) {
   const auto GETTER = ObjectLiteral::Property::GETTER;
   const auto SETTER = ObjectLiteral::Property::SETTER;
 
-  ZoneAllocationPolicy allocator(zone);
-
-  CustomMatcherZoneHashMap table(
-      Literal::Match, ZoneHashMap::kDefaultHashMapCapacity, allocator);
+  CustomMatcherZoneHashMap table(Literal::Match,
+                                 ZoneHashMap::kDefaultHashMapCapacity,
+                                 ZoneAllocationPolicy(zone));
   for (int i = properties()->length() - 1; i >= 0; i--) {
     ObjectLiteral::Property* property = properties()->at(i);
     if (property->is_computed_name()) continue;
@@ -347,7 +346,7 @@ void ObjectLiteral::CalculateEmitStore(Zone* zone) {
     DCHECK(!literal->IsNullLiteral());
 
     uint32_t hash = literal->Hash();
-    ZoneHashMap::Entry* entry = table.LookupOrInsert(literal, hash, allocator);
+    ZoneHashMap::Entry* entry = table.LookupOrInsert(literal, hash);
     if (entry->value == nullptr) {
       entry->value = property;
     } else {
@@ -927,6 +926,7 @@ Call::CallType Call::GetCallType() const {
   }
   if (property != nullptr) {
     if (property->IsPrivateReference()) {
+      if (is_optional_chain) return PRIVATE_OPTIONAL_CHAIN_CALL;
       return PRIVATE_CALL;
     }
     bool is_super = property->IsSuperAccess();
@@ -949,9 +949,7 @@ Call::CallType Call::GetCallType() const {
 
 CaseClause::CaseClause(Zone* zone, Expression* label,
                        const ScopedPtrList<Statement>& statements)
-    : label_(label), statements_(0, nullptr) {
-  statements.CopyTo(&statements_, zone);
-}
+    : label_(label), statements_(statements.ToConstVector(), zone) {}
 
 bool Literal::IsPropertyName() const {
   if (type() != kString) return false;
@@ -1062,7 +1060,7 @@ Literal* AstNodeFactory::NewNumberLiteral(double number, int pos) {
   if (DoubleToSmiInteger(number, &int_value)) {
     return NewSmiLiteral(int_value, pos);
   }
-  return new (zone_) Literal(number, pos);
+  return zone_->New<Literal>(number, pos);
 }
 
 const char* CallRuntime::debug_name() {

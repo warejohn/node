@@ -41,10 +41,7 @@ class ConcurrentMarkingState final
   explicit ConcurrentMarkingState(MemoryChunkDataMap* memory_chunk_data)
       : memory_chunk_data_(memory_chunk_data) {}
 
-  ConcurrentBitmap<AccessMode::ATOMIC>* bitmap(const MemoryChunk* chunk) {
-    DCHECK_EQ(reinterpret_cast<intptr_t>(&chunk->marking_bitmap_) -
-                  reinterpret_cast<intptr_t>(chunk),
-              MemoryChunk::kMarkBitmapOffset);
+  ConcurrentBitmap<AccessMode::ATOMIC>* bitmap(const BasicMemoryChunk* chunk) {
     return chunk->marking_bitmap<AccessMode::ATOMIC>();
   }
 
@@ -298,7 +295,7 @@ class ConcurrentMarkingVisitor final
 #ifdef THREAD_SANITIZER
     // This is needed because TSAN does not process the memory fence
     // emitted after page initialization.
-    MemoryChunk::FromHeapObject(heap_object)->SynchronizedHeapLoad();
+    BasicMemoryChunk::FromHeapObject(heap_object)->SynchronizedHeapLoad();
 #endif
   }
 
@@ -522,11 +519,15 @@ void ConcurrentMarking::ScheduleTasks() {
     // only use num_cores/2, leaving one of those for the main thread.
     // TODO(ulan): Use all cores on Mac 10.12+.
     total_task_count_ = Max(1, Min(kMaxTasks, (num_cores / 2) - 1));
-#else   // defined(OS_MACOSX)
+#else   // defined(V8_OS_MACOSX)
     // On other platforms use all logical cores, leaving one for the main
     // thread.
     total_task_count_ = Max(1, Min(kMaxTasks, num_cores - 2));
-#endif  // defined(OS_MACOSX)
+#endif  // defined(V8_OS_MACOSX)
+    if (FLAG_gc_experiment_reduce_concurrent_marking_tasks) {
+      // Use at most half of the cores in the experiment.
+      total_task_count_ = Max(1, Min(kMaxTasks, (num_cores / 2) - 1));
+    }
     DCHECK_LE(total_task_count_, kMaxTasks);
     // One task is for the main thread.
     STATIC_ASSERT(kMaxTasks + 1 <= MarkingWorklist::kMaxNumTasks);

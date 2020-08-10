@@ -3892,7 +3892,18 @@ void Assembler::vcvt_u32_f32(QwNeonRegister dst, QwNeonRegister src) {
   emit(EncodeNeonVCVT(U32, dst, F32, src));
 }
 
-enum UnaryOp { VMVN, VSWP, VABS, VABSF, VNEG, VNEGF };
+enum UnaryOp {
+  VMVN,
+  VSWP,
+  VABS,
+  VABSF,
+  VNEG,
+  VNEGF,
+  VRINTM,
+  VRINTN,
+  VRINTP,
+  VRINTZ
+};
 
 static Instr EncodeNeonUnaryOp(UnaryOp op, NeonRegType reg_type, NeonSize size,
                                int dst_code, int src_code) {
@@ -3919,6 +3930,18 @@ static Instr EncodeNeonUnaryOp(UnaryOp op, NeonRegType reg_type, NeonSize size,
     case VNEGF:
       DCHECK_EQ(Neon32, size);
       op_encoding = B16 | B10 | 0x7 * B7;
+      break;
+    case VRINTM:
+      op_encoding = B17 | 0xD * B7;
+      break;
+    case VRINTN:
+      op_encoding = B17 | 0x8 * B7;
+      break;
+    case VRINTP:
+      op_encoding = B17 | 0xF * B7;
+      break;
+    case VRINTZ:
+      op_encoding = B17 | 0xB * B7;
       break;
     default:
       UNREACHABLE();
@@ -4315,7 +4338,6 @@ void Assembler::vmull(NeonDataType dt, QwNeonRegister dst, DwVfpRegister src1,
   src2.split_code(&vm, &m);
   int size = NeonSz(dt);
   int u = NeonU(dt);
-  if (!u) UNIMPLEMENTED();
   emit(0xFU * B28 | B25 | u * B24 | B23 | d * B22 | size * B20 | vn * B16 |
        vd * B12 | 0xC * B8 | n * B7 | m * B5 | vm);
 }
@@ -4573,6 +4595,38 @@ void Assembler::vpmax(NeonDataType dt, DwVfpRegister dst, DwVfpRegister src1,
   // Dd = vpmax(Dn, Dm) SIMD integer pairwise MAX.
   // Instruction details available in ARM DDI 0406C.b, A8-986.
   emit(EncodeNeonPairwiseOp(VPMAX, dt, dst, src1, src2));
+}
+
+void Assembler::vrintm(NeonDataType dt, const QwNeonRegister dst,
+                       const QwNeonRegister src) {
+  // SIMD vector round floating-point to integer towards -Infinity.
+  // See ARM DDI 0487F.b, F6-5493.
+  DCHECK(IsEnabled(ARMv8));
+  emit(EncodeNeonUnaryOp(VRINTM, NEON_Q, NeonSize(dt), dst.code(), src.code()));
+}
+
+void Assembler::vrintn(NeonDataType dt, const QwNeonRegister dst,
+                       const QwNeonRegister src) {
+  // SIMD vector round floating-point to integer to Nearest.
+  // See ARM DDI 0487F.b, F6-5497.
+  DCHECK(IsEnabled(ARMv8));
+  emit(EncodeNeonUnaryOp(VRINTN, NEON_Q, NeonSize(dt), dst.code(), src.code()));
+}
+
+void Assembler::vrintp(NeonDataType dt, const QwNeonRegister dst,
+                       const QwNeonRegister src) {
+  // SIMD vector round floating-point to integer towards +Infinity.
+  // See ARM DDI 0487F.b, F6-5501.
+  DCHECK(IsEnabled(ARMv8));
+  emit(EncodeNeonUnaryOp(VRINTP, NEON_Q, NeonSize(dt), dst.code(), src.code()));
+}
+
+void Assembler::vrintz(NeonDataType dt, const QwNeonRegister dst,
+                       const QwNeonRegister src) {
+  // SIMD vector round floating-point to integer towards Zero.
+  // See ARM DDI 0487F.b, F6-5511.
+  DCHECK(IsEnabled(ARMv8));
+  emit(EncodeNeonUnaryOp(VRINTZ, NEON_Q, NeonSize(dt), dst.code(), src.code()));
 }
 
 void Assembler::vtst(NeonSize size, QwNeonRegister dst, QwNeonRegister src1,

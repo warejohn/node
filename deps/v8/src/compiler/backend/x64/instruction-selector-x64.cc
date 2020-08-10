@@ -10,6 +10,7 @@
 #include "src/compiler/node-matchers.h"
 #include "src/compiler/node-properties.h"
 #include "src/roots/roots-inl.h"
+#include "src/wasm/simd-shuffle.h"
 
 namespace v8 {
 namespace internal {
@@ -83,7 +84,8 @@ class X64OperandGenerator final : public OperandGenerator {
         // When pointer compression is enabled 32-bit memory operands can be
         // used for tagged values.
         return rep == MachineRepresentation::kWord32 ||
-               (COMPRESS_POINTERS_BOOL && IsAnyTagged(rep));
+               (COMPRESS_POINTERS_BOOL &&
+                (IsAnyTagged(rep) || IsAnyCompressed(rep)));
       case kX64Cmp16:
       case kX64Test16:
         return rep == MachineRepresentation::kWord16;
@@ -360,6 +362,12 @@ void InstructionSelector::VisitLoadTransform(Node* node) {
     case LoadTransformation::kI64x2Load32x2U:
       opcode = kX64I64x2Load32x2U;
       break;
+    case LoadTransformation::kS128LoadMem32Zero:
+      opcode = kX64S128LoadMem32Zero;
+      break;
+    case LoadTransformation::kS128LoadMem64Zero:
+      opcode = kX64S128LoadMem64Zero;
+      break;
     default:
       UNREACHABLE();
   }
@@ -407,6 +415,11 @@ void InstructionSelector::VisitStore(Node* node) {
 
   StoreRepresentation store_rep = StoreRepresentationOf(node->op());
   WriteBarrierKind write_barrier_kind = store_rep.write_barrier_kind();
+
+  if (FLAG_enable_unconditional_write_barriers &&
+      CanBeTaggedOrCompressedPointer(store_rep.representation())) {
+    write_barrier_kind = kFullWriteBarrier;
+  }
 
   if (write_barrier_kind != kNoWriteBarrier &&
       V8_LIKELY(!FLAG_disable_write_barriers)) {
@@ -1461,7 +1474,16 @@ void VisitFloatUnop(InstructionSelector* selector, Node* node, Node* input,
   V(Float64RoundTruncate, kSSEFloat64Round | MiscField::encode(kRoundToZero)) \
   V(Float32RoundTiesEven,                                                     \
     kSSEFloat32Round | MiscField::encode(kRoundToNearest))                    \
-  V(Float64RoundTiesEven, kSSEFloat64Round | MiscField::encode(kRoundToNearest))
+  V(Float64RoundTiesEven,                                                     \
+    kSSEFloat64Round | MiscField::encode(kRoundToNearest))                    \
+  V(F32x4Ceil, kX64F32x4Round | MiscField::encode(kRoundUp))                  \
+  V(F32x4Floor, kX64F32x4Round | MiscField::encode(kRoundDown))               \
+  V(F32x4Trunc, kX64F32x4Round | MiscField::encode(kRoundToZero))             \
+  V(F32x4NearestInt, kX64F32x4Round | MiscField::encode(kRoundToNearest))     \
+  V(F64x2Ceil, kX64F64x2Round | MiscField::encode(kRoundUp))                  \
+  V(F64x2Floor, kX64F64x2Round | MiscField::encode(kRoundDown))               \
+  V(F64x2Trunc, kX64F64x2Round | MiscField::encode(kRoundToZero))             \
+  V(F64x2NearestInt, kX64F64x2Round | MiscField::encode(kRoundToNearest))
 
 #define RO_VISITOR(Name, opcode)                      \
   void InstructionSelector::Visit##Name(Node* node) { \
@@ -1898,16 +1920,33 @@ void VisitWord32EqualImpl(InstructionSelector* selector, Node* node,
     X64OperandGenerator g(selector);
     const RootsTable& roots_table = selector->isolate()->roots_table();
     RootIndex root_index;
-    CompressedHeapObjectBinopMatcher m(node);
-    if (m.right().HasValue() &&
-        roots_table.IsRootHandle(m.right().Value(), &root_index)) {
+    Node* left = nullptr;
+    Handle<HeapObject> right;
+    // HeapConstants and CompressedHeapConstants can be treated the same when
+    // using them as an input to a 32-bit comparison. Check whether either is
+    // present.
+    {
+      CompressedHeapObjectBinopMatcher m(node);
+      if (m.right().HasValue()) {
+        left = m.left().node();
+        right = m.right().Value();
+      } else {
+        HeapObjectBinopMatcher m2(node);
+        if (m2.right().HasValue()) {
+          left = m2.left().node();
+          right = m2.right().Value();
+        }
+      }
+    }
+    if (!right.is_null() && roots_table.IsRootHandle(right, &root_index)) {
+      DCHECK_NE(left, nullptr);
       InstructionCode opcode =
           kX64Cmp32 | AddressingModeField::encode(kMode_Root);
       return VisitCompare(
           selector, opcode,
           g.TempImmediate(
               TurboAssemblerBase::RootRegisterOffsetForRootIndex(root_index)),
-          g.UseRegister(m.left().node()), cont);
+          g.UseRegister(left), cont);
     }
   }
   VisitWordCompare(selector, node, kX64Cmp32, cont);
@@ -2674,6 +2713,7 @@ VISIT_ATOMIC_BINOP(Xor)
   V(I32x4MinU)             \
   V(I32x4MaxU)             \
   V(I32x4GeU)              \
+  V(I32x4DotI16x8S)        \
   V(I16x8SConvertI32x4)    \
   V(I16x8Add)              \
   V(I16x8AddSaturateS)     \
@@ -2766,16 +2806,36 @@ VISIT_ATOMIC_BINOP(Xor)
   V(I8x16ShrU)
 
 #define SIMD_ANYTRUE_LIST(V) \
-  V(S1x2AnyTrue)             \
-  V(S1x4AnyTrue)             \
-  V(S1x8AnyTrue)             \
-  V(S1x16AnyTrue)
+  V(V64x2AnyTrue)            \
+  V(V32x4AnyTrue)            \
+  V(V16x8AnyTrue)            \
+  V(V8x16AnyTrue)
 
 #define SIMD_ALLTRUE_LIST(V) \
-  V(S1x2AllTrue)             \
-  V(S1x4AllTrue)             \
-  V(S1x8AllTrue)             \
-  V(S1x16AllTrue)
+  V(V64x2AllTrue)            \
+  V(V32x4AllTrue)            \
+  V(V16x8AllTrue)            \
+  V(V8x16AllTrue)
+
+void InstructionSelector::VisitS128Const(Node* node) {
+  X64OperandGenerator g(this);
+  static const int kUint32Immediates = kSimd128Size / sizeof(uint32_t);
+  uint32_t val[kUint32Immediates];
+  memcpy(val, S128ImmediateParameterOf(node->op()).data(), kSimd128Size);
+  // If all bytes are zeros or ones, avoid emitting code for generic constants
+  bool all_zeros = !(val[0] || val[1] || val[2] || val[3]);
+  bool all_ones = val[0] == UINT32_MAX && val[1] == UINT32_MAX &&
+                  val[2] == UINT32_MAX && val[3] == UINT32_MAX;
+  InstructionOperand dst = g.DefineAsRegister(node);
+  if (all_zeros) {
+    Emit(kX64S128Zero, dst);
+  } else if (all_ones) {
+    Emit(kX64S128AllOnes, dst);
+  } else {
+    Emit(kX64S128Const, dst, g.UseImmediate(val[0]), g.UseImmediate(val[1]),
+         g.UseImmediate(val[2]), g.UseImmediate(val[3]));
+  }
+}
 
 void InstructionSelector::VisitS128Zero(Node* node) {
   X64OperandGenerator g(this);
@@ -3089,31 +3149,6 @@ void InstructionSelector::VisitInt64AbsWithOverflow(Node* node) {
 
 namespace {
 
-// Packs a 4 lane shuffle into a single imm8 suitable for use by pshufd,
-// pshuflw, and pshufhw.
-uint8_t PackShuffle4(uint8_t* shuffle) {
-  return (shuffle[0] & 3) | ((shuffle[1] & 3) << 2) | ((shuffle[2] & 3) << 4) |
-         ((shuffle[3] & 3) << 6);
-}
-
-// Gets an 8 bit lane mask suitable for 16x8 pblendw.
-uint8_t PackBlend8(const uint8_t* shuffle16x8) {
-  int8_t result = 0;
-  for (int i = 0; i < 8; ++i) {
-    result |= (shuffle16x8[i] >= 8 ? 1 : 0) << i;
-  }
-  return result;
-}
-
-// Gets an 8 bit lane mask suitable for 32x4 pblendw.
-uint8_t PackBlend4(const uint8_t* shuffle32x4) {
-  int8_t result = 0;
-  for (int i = 0; i < 4; ++i) {
-    result |= (shuffle32x4[i] >= 4 ? 0x3 : 0) << (i * 2);
-  }
-  return result;
-}
-
 // Returns true if shuffle can be decomposed into two 16x4 half shuffles
 // followed by a 16x8 blend.
 // E.g. [3 2 1 0 15 14 13 12].
@@ -3256,7 +3291,7 @@ void InstructionSelector::VisitS8x16Shuffle(Node* node) {
   uint8_t shuffle16x8[8];
   int index;
   const ShuffleEntry* arch_shuffle;
-  if (TryMatchConcat(shuffle, &offset)) {
+  if (wasm::SimdShuffle::TryMatchConcat(shuffle, &offset)) {
     // Swap inputs from the normal order for (v)palignr.
     SwapShuffleInputs(node);
     is_swizzle = false;        // It's simpler to just handle the general case.
@@ -3275,10 +3310,10 @@ void InstructionSelector::VisitS8x16Shuffle(Node* node) {
     // same-as-first.
     src1_needs_reg = arch_shuffle->src1_needs_reg;
     no_same_as_first = false;
-  } else if (TryMatch32x4Shuffle(shuffle, shuffle32x4)) {
-    uint8_t shuffle_mask = PackShuffle4(shuffle32x4);
+  } else if (wasm::SimdShuffle::TryMatch32x4Shuffle(shuffle, shuffle32x4)) {
+    uint8_t shuffle_mask = wasm::SimdShuffle::PackShuffle4(shuffle32x4);
     if (is_swizzle) {
-      if (TryMatchIdentity(shuffle)) {
+      if (wasm::SimdShuffle::TryMatchIdentity(shuffle)) {
         // Bypass normal shuffle code generation in this case.
         EmitIdentity(node);
         return;
@@ -3295,9 +3330,9 @@ void InstructionSelector::VisitS8x16Shuffle(Node* node) {
     } else {
       // 2 operand shuffle
       // A blend is more efficient than a general 32x4 shuffle; try it first.
-      if (TryMatchBlend(shuffle)) {
+      if (wasm::SimdShuffle::TryMatchBlend(shuffle)) {
         opcode = kX64S16x8Blend;
-        uint8_t blend_mask = PackBlend4(shuffle32x4);
+        uint8_t blend_mask = wasm::SimdShuffle::PackBlend4(shuffle32x4);
         imms[imm_count++] = blend_mask;
       } else {
         opcode = kX64S32x4Shuffle;
@@ -3308,17 +3343,17 @@ void InstructionSelector::VisitS8x16Shuffle(Node* node) {
         src0_needs_reg = true;
         src1_needs_reg = true;
         imms[imm_count++] = shuffle_mask;
-        uint8_t blend_mask = PackBlend4(shuffle32x4);
+        uint8_t blend_mask = wasm::SimdShuffle::PackBlend4(shuffle32x4);
         imms[imm_count++] = blend_mask;
       }
     }
-  } else if (TryMatch16x8Shuffle(shuffle, shuffle16x8)) {
+  } else if (wasm::SimdShuffle::TryMatch16x8Shuffle(shuffle, shuffle16x8)) {
     uint8_t blend_mask;
-    if (TryMatchBlend(shuffle)) {
+    if (wasm::SimdShuffle::TryMatchBlend(shuffle)) {
       opcode = kX64S16x8Blend;
-      blend_mask = PackBlend8(shuffle16x8);
+      blend_mask = wasm::SimdShuffle::PackBlend8(shuffle16x8);
       imms[imm_count++] = blend_mask;
-    } else if (TryMatchDup<8>(shuffle, &index)) {
+    } else if (wasm::SimdShuffle::TryMatchSplat<8>(shuffle, &index)) {
       opcode = kX64S16x8Dup;
       src0_needs_reg = false;
       imms[imm_count++] = index;
@@ -3327,13 +3362,13 @@ void InstructionSelector::VisitS8x16Shuffle(Node* node) {
       // Half-shuffles don't need DefineSameAsFirst or UseRegister(src0).
       no_same_as_first = true;
       src0_needs_reg = false;
-      uint8_t mask_lo = PackShuffle4(shuffle16x8);
-      uint8_t mask_hi = PackShuffle4(shuffle16x8 + 4);
+      uint8_t mask_lo = wasm::SimdShuffle::PackShuffle4(shuffle16x8);
+      uint8_t mask_hi = wasm::SimdShuffle::PackShuffle4(shuffle16x8 + 4);
       imms[imm_count++] = mask_lo;
       imms[imm_count++] = mask_hi;
       if (!is_swizzle) imms[imm_count++] = blend_mask;
     }
-  } else if (TryMatchDup<16>(shuffle, &index)) {
+  } else if (wasm::SimdShuffle::TryMatchSplat<16>(shuffle, &index)) {
     opcode = kX64S8x16Dup;
     no_same_as_first = false;
     src0_needs_reg = true;
@@ -3343,10 +3378,10 @@ void InstructionSelector::VisitS8x16Shuffle(Node* node) {
     // Use same-as-first for general swizzle, but not shuffle.
     no_same_as_first = !is_swizzle;
     src0_needs_reg = !no_same_as_first;
-    imms[imm_count++] = Pack4Lanes(shuffle);
-    imms[imm_count++] = Pack4Lanes(shuffle + 4);
-    imms[imm_count++] = Pack4Lanes(shuffle + 8);
-    imms[imm_count++] = Pack4Lanes(shuffle + 12);
+    imms[imm_count++] = wasm::SimdShuffle::Pack4Lanes(shuffle);
+    imms[imm_count++] = wasm::SimdShuffle::Pack4Lanes(shuffle + 4);
+    imms[imm_count++] = wasm::SimdShuffle::Pack4Lanes(shuffle + 8);
+    imms[imm_count++] = wasm::SimdShuffle::Pack4Lanes(shuffle + 12);
     temps[temp_count++] = g.TempSimd128Register();
   }
 

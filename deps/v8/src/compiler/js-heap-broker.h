@@ -14,6 +14,8 @@
 #include "src/compiler/refs-map.h"
 #include "src/compiler/serializer-hints.h"
 #include "src/handles/handles.h"
+#include "src/handles/persistent-handles.h"
+#include "src/heap/local-heap.h"
 #include "src/interpreter/bytecode-array-accessor.h"
 #include "src/objects/feedback-vector.h"
 #include "src/objects/function-kind.h"
@@ -33,20 +35,20 @@ std::ostream& operator<<(std::ostream& os, const ObjectRef& ref);
 #define TRACE_BROKER(broker, x)                                      \
   do {                                                               \
     if (broker->tracing_enabled() && FLAG_trace_heap_broker_verbose) \
-      broker->Trace() << x << '\n';                                  \
+      StdoutStream{} << broker->Trace() << x << '\n';                \
   } while (false)
 
 #define TRACE_BROKER_MEMORY(broker, x)                              \
   do {                                                              \
     if (broker->tracing_enabled() && FLAG_trace_heap_broker_memory) \
-      broker->Trace() << x << std::endl;                            \
+      StdoutStream{} << broker->Trace() << x << std::endl;          \
   } while (false)
 
-#define TRACE_BROKER_MISSING(broker, x)                             \
-  do {                                                              \
-    if (broker->tracing_enabled())                                  \
-      broker->Trace() << "Missing " << x << " (" << __FILE__ << ":" \
-                      << __LINE__ << ")" << std::endl;              \
+#define TRACE_BROKER_MISSING(broker, x)                                        \
+  do {                                                                         \
+    if (broker->tracing_enabled())                                             \
+      StdoutStream{} << broker->Trace() << "Missing " << x << " (" << __FILE__ \
+                     << ":" << __LINE__ << ")" << std::endl;                   \
   } while (false)
 
 struct PropertyAccessTarget {
@@ -74,7 +76,17 @@ struct PropertyAccessTarget {
 class V8_EXPORT_PRIVATE JSHeapBroker {
  public:
   JSHeapBroker(Isolate* isolate, Zone* broker_zone, bool tracing_enabled,
-               bool is_concurrent_inlining);
+               bool is_concurrent_inlining, bool is_native_context_independent,
+               std::unique_ptr<PersistentHandles> persistent_handles);
+
+  // For use only in tests, sets default values for some arguments. Avoids
+  // churn when new flags are added.
+  JSHeapBroker(Isolate* isolate, Zone* broker_zone,
+               std::unique_ptr<PersistentHandles> persistent_handles)
+      : JSHeapBroker(isolate, broker_zone, FLAG_trace_heap_broker, false, false,
+                     std::move(persistent_handles)) {}
+
+  ~JSHeapBroker();
 
   // The compilation target's native context. We need the setter because at
   // broker construction time we don't yet have the canonical handle.
@@ -89,9 +101,14 @@ class V8_EXPORT_PRIVATE JSHeapBroker {
   Zone* zone() const { return zone_; }
   bool tracing_enabled() const { return tracing_enabled_; }
   bool is_concurrent_inlining() const { return is_concurrent_inlining_; }
+  bool is_native_context_independent() const {
+    return is_native_context_independent_;
+  }
 
   enum BrokerMode { kDisabled, kSerializing, kSerialized, kRetired };
   BrokerMode mode() const { return mode_; }
+  void InitializeLocalHeap();
+  void TearDownLocalHeap();
   void StopSerializing();
   void Retire();
   bool SerializingAllowed() const;
@@ -182,6 +199,11 @@ class V8_EXPORT_PRIVATE JSHeapBroker {
       CompilationDependencies* dependencies = nullptr,
       SerializationPolicy policy = SerializationPolicy::kAssumeSerialized);
 
+  MinimorphicLoadPropertyAccessInfo GetPropertyAccessInfo(
+      MinimorphicLoadPropertyAccessFeedback const& feedback,
+      FeedbackSource const& source,
+      SerializationPolicy policy = SerializationPolicy::kAssumeSerialized);
+
   StringRef GetTypedArrayStringTag(ElementsKind kind);
 
   bool ShouldBeSerializedForCompilation(const SharedFunctionInfoRef& shared,
@@ -193,7 +215,21 @@ class V8_EXPORT_PRIVATE JSHeapBroker {
   bool IsSerializedForCompilation(const SharedFunctionInfoRef& shared,
                                   const FeedbackVectorRef& feedback) const;
 
-  std::ostream& Trace() const;
+  template <typename T>
+  Handle<T> NewPersistentHandle(T obj) {
+    return ph_->NewHandle(obj);
+  }
+
+  template <typename T>
+  Handle<T> NewPersistentHandle(Handle<T> obj) {
+    return ph_->NewHandle(*obj);
+  }
+
+  LocalHeap* local_heap() {
+    return local_heap_.has_value() ? &(*local_heap_) : nullptr;
+  }
+
+  std::string Trace() const;
   void IncrementTracingIndentation();
   void DecrementTracingIndentation();
 
@@ -204,15 +240,20 @@ class V8_EXPORT_PRIVATE JSHeapBroker {
   friend class ObjectRef;
   friend class ObjectData;
 
+  bool CanUseFeedback(const FeedbackNexus& nexus) const;
+  const ProcessedFeedback& NewInsufficientFeedback(FeedbackSlotKind kind) const;
+
   // Bottleneck FeedbackNexus access here, for storage in the broker
   // or on-the-fly usage elsewhere in the compiler.
-  ForInHint ReadFeedbackForForIn(FeedbackSource const& source) const;
-  CompareOperationHint ReadFeedbackForCompareOperation(
+  ProcessedFeedback const& ReadFeedbackForArrayOrObjectLiteral(
+      FeedbackSource const& source);
+  ProcessedFeedback const& ReadFeedbackForBinaryOperation(
       FeedbackSource const& source) const;
-  BinaryOperationHint ReadFeedbackForBinaryOperation(
-      FeedbackSource const& source) const;
-
   ProcessedFeedback const& ReadFeedbackForCall(FeedbackSource const& source);
+  ProcessedFeedback const& ReadFeedbackForCompareOperation(
+      FeedbackSource const& source) const;
+  ProcessedFeedback const& ReadFeedbackForForIn(
+      FeedbackSource const& source) const;
   ProcessedFeedback const& ReadFeedbackForGlobalAccess(
       FeedbackSource const& source);
   ProcessedFeedback const& ReadFeedbackForInstanceOf(
@@ -220,8 +261,6 @@ class V8_EXPORT_PRIVATE JSHeapBroker {
   ProcessedFeedback const& ReadFeedbackForPropertyAccess(
       FeedbackSource const& source, AccessMode mode,
       base::Optional<NameRef> static_name);
-  ProcessedFeedback const& ReadFeedbackForArrayOrObjectLiteral(
-      FeedbackSource const& source);
   ProcessedFeedback const& ReadFeedbackForRegExpLiteral(
       FeedbackSource const& source);
   ProcessedFeedback const& ReadFeedbackForTemplateObject(
@@ -242,7 +281,9 @@ class V8_EXPORT_PRIVATE JSHeapBroker {
   BrokerMode mode_ = kDisabled;
   bool const tracing_enabled_;
   bool const is_concurrent_inlining_;
-  mutable StdoutStream trace_out_;
+  bool const is_native_context_independent_;
+  std::unique_ptr<PersistentHandles> ph_;
+  base::Optional<LocalHeap> local_heap_;
   unsigned trace_indentation_ = 0;
   PerIsolateCompilerCache* compiler_cache_ = nullptr;
   ZoneUnorderedMap<FeedbackSource, ProcessedFeedback const*,
@@ -252,6 +293,8 @@ class V8_EXPORT_PRIVATE JSHeapBroker {
   ZoneUnorderedMap<PropertyAccessTarget, PropertyAccessInfo,
                    PropertyAccessTarget::Hash, PropertyAccessTarget::Equal>
       property_access_infos_;
+  ZoneUnorderedMap<int, MinimorphicLoadPropertyAccessInfo>
+      minimorphic_property_access_infos_;
 
   ZoneVector<ObjectData*> typed_array_string_tags_;
 
@@ -272,8 +315,8 @@ class V8_EXPORT_PRIVATE JSHeapBroker {
   ZoneMultimap<SerializedFunction, HintsVector> serialized_functions_;
 
   static const size_t kMaxSerializedFunctionsCacheSize = 200;
-  static const size_t kMinimalRefsBucketCount = 8;     // must be power of 2
-  static const size_t kInitialRefsBucketCount = 1024;  // must be power of 2
+  static const uint32_t kMinimalRefsBucketCount = 8;     // must be power of 2
+  static const uint32_t kInitialRefsBucketCount = 1024;  // must be power of 2
 };
 
 class TraceScope {

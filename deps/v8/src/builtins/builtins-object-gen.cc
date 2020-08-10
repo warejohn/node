@@ -314,7 +314,8 @@ TNode<JSArray> ObjectEntriesValuesBuiltinsAssembler::FastGetOwnValuesOrEntries(
         TNode<JSArray> array;
         TNode<FixedArrayBase> elements;
         std::tie(array, elements) = AllocateUninitializedJSArrayWithElements(
-            PACKED_ELEMENTS, array_map, SmiConstant(2), {}, IntPtrConstant(2));
+            PACKED_ELEMENTS, array_map, SmiConstant(2), base::nullopt,
+            IntPtrConstant(2));
         StoreFixedArrayElement(CAST(elements), 0, next_key, SKIP_WRITE_BARRIER);
         StoreFixedArrayElement(CAST(elements), 1, value, SKIP_WRITE_BARRIER);
         value = TNode<JSArray>::UncheckedCast(array);
@@ -499,7 +500,7 @@ TF_BUILTIN(ObjectKeys, ObjectBuiltinsAssembler) {
         LoadJSArrayElementsMap(PACKED_ELEMENTS, native_context);
     TNode<Smi> array_length = SmiTag(Signed(object_enum_length));
     std::tie(array, elements) = AllocateUninitializedJSArrayWithElements(
-        PACKED_ELEMENTS, array_map, array_length, {},
+        PACKED_ELEMENTS, array_map, array_length, base::nullopt,
         Signed(object_enum_length));
     CopyFixedArrayElements(PACKED_ELEMENTS, object_enum_keys, elements,
                            object_enum_length, SKIP_WRITE_BARRIER);
@@ -595,7 +596,7 @@ TF_BUILTIN(ObjectGetOwnPropertyNames, ObjectBuiltinsAssembler) {
     TNode<JSArray> array;
     TNode<FixedArrayBase> elements;
     std::tie(array, elements) = AllocateUninitializedJSArrayWithElements(
-        PACKED_ELEMENTS, array_map, array_length, {},
+        PACKED_ELEMENTS, array_map, array_length, base::nullopt,
         Signed(object_enum_length));
     CopyFixedArrayElements(PACKED_ELEMENTS, object_enum_keys, elements,
                            object_enum_length, SKIP_WRITE_BARRIER);
@@ -1152,6 +1153,18 @@ TF_BUILTIN(InstanceOf, ObjectBuiltinsAssembler) {
   TNode<Object> callable = CAST(Parameter(Descriptor::kRight));
   TNode<Context> context = CAST(Parameter(Descriptor::kContext));
 
+  Return(InstanceOf(object, callable, context));
+}
+
+TF_BUILTIN(InstanceOf_WithFeedback, ObjectBuiltinsAssembler) {
+  TNode<Object> object = CAST(Parameter(Descriptor::kLeft));
+  TNode<Object> callable = CAST(Parameter(Descriptor::kRight));
+  TNode<Context> context = CAST(Parameter(Descriptor::kContext));
+  TNode<HeapObject> maybe_feedback_vector =
+      CAST(Parameter(Descriptor::kMaybeFeedbackVector));
+  TNode<UintPtrT> slot = UncheckedCast<UintPtrT>(Parameter(Descriptor::kSlot));
+
+  CollectInstanceOfFeedback(callable, context, maybe_feedback_vector, slot);
   Return(InstanceOf(object, callable, context));
 }
 

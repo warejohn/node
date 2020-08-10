@@ -1567,7 +1567,7 @@ using SimulatorRuntimeDirectGetterCall = void (*)(int32_t arg0, int32_t arg1);
 using SimulatorRuntimeProfilingGetterCall = void (*)(int32_t arg0, int32_t arg1,
                                                      void* arg2);
 
-// Separate for fine-grained UBSan blacklisting. Casting any given C++
+// Separate for fine-grained UBSan blocklisting. Casting any given C++
 // function to {SimulatorRuntimeCall} is undefined behavior; but since
 // the target function can indeed be any function that's exposed via
 // the "fast C call" mechanism, we can't reconstruct its signature here.
@@ -4241,6 +4241,28 @@ void RoundingAverageUnsigned(Simulator* simulator, int Vd, int Vm, int Vn) {
   simulator->set_neon_register<T, SIZE>(Vd, src1);
 }
 
+template <typename NarrowType, typename WideType>
+void MultiplyLong(Simulator* simulator, int Vd, int Vn, int Vm) {
+  DCHECK_EQ(sizeof(WideType), 2 * sizeof(NarrowType));
+  static const int kElems = kSimd128Size / sizeof(WideType);
+  NarrowType src1[kElems], src2[kElems];
+  WideType dst[kElems];
+
+  // Get the entire d reg, then memcpy it to an array so we can address the
+  // underlying datatype easily.
+  uint64_t tmp;
+  simulator->get_d_register(Vn, &tmp);
+  memcpy(src1, &tmp, sizeof(tmp));
+  simulator->get_d_register(Vm, &tmp);
+  memcpy(src2, &tmp, sizeof(tmp));
+
+  for (int i = 0; i < kElems; i++) {
+    dst[i] = WideType{src1[i]} * WideType{src2[i]};
+  }
+
+  simulator->set_neon_register<WideType>(Vd, dst);
+}
+
 void Simulator::DecodeSpecialCondition(Instruction* instr) {
   switch (instr->SpecialValue()) {
     case 4: {
@@ -4685,6 +4707,21 @@ void Simulator::DecodeSpecialCondition(Instruction* instr) {
           case Neon64:
             ArithmeticShiftRight<int64_t, kSimd128Size>(this, Vd, Vm, shift);
             break;
+        }
+      } else if (instr->Bits(11, 8) == 0xC && instr->Bit(6) == 0 &&
+                 instr->Bit(4) == 0) {
+        // vmull.s<size> Qd, Dn, Dm
+        NeonSize size = static_cast<NeonSize>(instr->Bits(21, 20));
+        int Vd = instr->VFPDRegValue(kSimd128Precision);
+        int Vn = instr->VFPNRegValue(kDoublePrecision);
+        int Vm = instr->VFPMRegValue(kDoublePrecision);
+        switch (size) {
+          case Neon16: {
+            MultiplyLong<int16_t, int32_t>(this, Vd, Vn, Vm);
+            break;
+          }
+          default:
+            UNIMPLEMENTED();
         }
       } else {
         UNIMPLEMENTED();
@@ -5375,7 +5412,8 @@ void Simulator::DecodeSpecialCondition(Instruction* instr) {
           } else {
             UNIMPLEMENTED();
           }
-        } else if (instr->Bits(19, 18) == 0x2 && instr->Bits(11, 8) == 0x5) {
+        } else if (instr->Bits(19, 18) == 0x2 && instr->Bits(17, 16) == 0x3 &&
+                   instr->Bits(11, 8) == 0x5) {
           // vrecpe/vrsqrte.f32 Qd, Qm.
           int Vd = instr->VFPDRegValue(kSimd128Precision);
           int Vm = instr->VFPMRegValue(kSimd128Precision);
@@ -5441,6 +5479,42 @@ void Simulator::DecodeSpecialCondition(Instruction* instr) {
             default:
               UNIMPLEMENTED();
               break;
+          }
+        } else if (instr->Bits(17, 16) == 0x2 && instr->Bit(10) == 1) {
+          // vrint<q>.<dt> <Dd>, <Dm>
+          // vrint<q>.<dt> <Qd>, <Qm>
+          // See F6.1.205
+          int regs = instr->Bit(6) + 1;
+          int rounding_mode = instr->Bits(9, 7);
+          float (*fproundint)(float) = nullptr;
+          switch (rounding_mode) {
+            case 0:
+              fproundint = &nearbyintf;
+              break;
+            case 3:
+              fproundint = &truncf;
+              break;
+            case 5:
+              fproundint = &floorf;
+              break;
+            case 7:
+              fproundint = &ceilf;
+              break;
+            default:
+              UNIMPLEMENTED();
+          }
+          int vm = instr->VFPMRegValue(kDoublePrecision);
+          int vd = instr->VFPDRegValue(kDoublePrecision);
+
+          float floats[2];
+          for (int r = 0; r < regs; r++) {
+            // We cannot simply use GetVFPSingleValue since our Q registers
+            // might not map to any S registers at all.
+            get_neon_register<float, kDoubleSize>(vm + r, floats);
+            for (int e = 0; e < 2; e++) {
+              floats[e] = canonicalizeNaN(fproundint(floats[e]));
+            }
+            set_neon_register<float, kDoubleSize>(vd + r, floats);
           }
         } else {
           UNIMPLEMENTED();
@@ -5542,18 +5616,17 @@ void Simulator::DecodeSpecialCondition(Instruction* instr) {
                  instr->Bit(4) == 0) {
         // vmull.u<size> Qd, Dn, Dm
         NeonSize size = static_cast<NeonSize>(instr->Bits(21, 20));
-        if (size != Neon32) UNIMPLEMENTED();
-
         int Vd = instr->VFPDRegValue(kSimd128Precision);
         int Vn = instr->VFPNRegValue(kDoublePrecision);
         int Vm = instr->VFPMRegValue(kDoublePrecision);
-        uint64_t src1, src2, dst[2];
-
-        get_d_register(Vn, &src1);
-        get_d_register(Vm, &src2);
-        dst[0] = (src1 & 0xFFFFFFFFULL) * (src2 & 0xFFFFFFFFULL);
-        dst[1] = (src1 >> 32) * (src2 >> 32);
-        set_neon_register<uint64_t>(Vd, dst);
+        switch (size) {
+          case Neon32: {
+            MultiplyLong<uint32_t, uint64_t>(this, Vd, Vn, Vm);
+            break;
+          }
+          default:
+            UNIMPLEMENTED();
+        }
       } else {
         UNIMPLEMENTED();
       }
@@ -5658,12 +5731,12 @@ void Simulator::DecodeSpecialCondition(Instruction* instr) {
           int32_t address = get_register(Rn);
           int regs = instr->Bit(5) + 1;
           int size = instr->Bits(7, 6);
-          uint32_t q_data[4];
+          uint32_t q_data[2];
           switch (size) {
             case Neon8: {
               uint8_t data = ReadBU(address);
               uint8_t* dst = reinterpret_cast<uint8_t*>(q_data);
-              for (int i = 0; i < 16; i++) {
+              for (int i = 0; i < 8; i++) {
                 dst[i] = data;
               }
               break;
@@ -5671,21 +5744,21 @@ void Simulator::DecodeSpecialCondition(Instruction* instr) {
             case Neon16: {
               uint16_t data = ReadHU(address);
               uint16_t* dst = reinterpret_cast<uint16_t*>(q_data);
-              for (int i = 0; i < 8; i++) {
+              for (int i = 0; i < 4; i++) {
                 dst[i] = data;
               }
               break;
             }
             case Neon32: {
               uint32_t data = ReadW(address);
-              for (int i = 0; i < 4; i++) {
+              for (int i = 0; i < 2; i++) {
                 q_data[i] = data;
               }
               break;
             }
           }
           for (int r = 0; r < regs; r++) {
-            set_neon_register(Vd + r, q_data);
+            set_neon_register<uint32_t, kDoubleSize>(Vd + r, q_data);
           }
           if (Rm != 15) {
             if (Rm == 13) {

@@ -99,7 +99,7 @@ Code Interpreter::GetBytecodeHandler(Bytecode bytecode,
 void Interpreter::SetBytecodeHandler(Bytecode bytecode,
                                      OperandScale operand_scale, Code handler) {
   DCHECK(handler.is_off_heap_trampoline());
-  DCHECK(handler.kind() == Code::BYTECODE_HANDLER);
+  DCHECK(handler.kind() == CodeKind::BYTECODE_HANDLER);
   size_t index = GetDispatchTableIndex(bytecode, operand_scale);
   dispatch_table_[index] = handler.InstructionStart();
 }
@@ -149,7 +149,7 @@ InterpreterCompilationJob::InterpreterCompilationJob(
     AccountingAllocator* allocator,
     std::vector<FunctionLiteral*>* eager_inner_literals)
     : UnoptimizedCompilationJob(parse_info->stack_limit(), parse_info,
-                                &compilation_info_, CanOffThreadFinalize::kYes),
+                                &compilation_info_),
       zone_(allocator, ZONE_NAME),
       compilation_info_(&zone_, parse_info, literal),
       generator_(&zone_, &compilation_info_, parse_info->ast_string_constants(),
@@ -194,14 +194,14 @@ void InterpreterCompilationJob::CheckAndPrintBytecodeMismatch(
     MaybeHandle<String> maybe_name = parse_info()->literal()->GetName(isolate);
     Handle<String> name;
     if (maybe_name.ToHandle(&name) && name->length() != 0) {
-      name->StringPrint(std::cerr);
+      name->PrintUC16(std::cerr);
     } else {
       std::cerr << "anonymous";
     }
     Object script_name = script->GetNameOrSourceURL();
     if (script_name.IsString()) {
       std::cerr << " ";
-      String::cast(script_name).StringPrint(std::cerr);
+      String::cast(script_name).PrintUC16(std::cerr);
       std::cerr << ":" << parse_info()->literal()->start_position();
     }
 #endif
@@ -287,7 +287,7 @@ Interpreter::NewSourcePositionCollectionJob(
   auto job = std::make_unique<InterpreterCompilationJob>(parse_info, literal,
                                                          allocator, nullptr);
   job->compilation_info()->SetBytecodeArray(existing_bytecode);
-  return std::unique_ptr<UnoptimizedCompilationJob> { static_cast<UnoptimizedCompilationJob*>(job.release()) };
+  return job;
 }
 
 void Interpreter::ForEachBytecode(
@@ -342,7 +342,7 @@ bool Interpreter::IsDispatchTableInitialized() const {
 }
 
 const char* Interpreter::LookupNameOfBytecodeHandler(const Code code) {
-  if (code.kind() == Code::BYTECODE_HANDLER) {
+  if (code.kind() == CodeKind::BYTECODE_HANDLER) {
     return Builtins::name(code.builtin_index());
   }
   return nullptr;

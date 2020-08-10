@@ -49,6 +49,7 @@ struct WasmModule;
 #define WASM_RUNTIME_STUB_LIST(V, VTRAP) \
   FOREACH_WASM_TRAPREASON(VTRAP)         \
   V(WasmCompileLazy)                     \
+  V(WasmTriggerTierUp)                   \
   V(WasmDebugBreak)                      \
   V(WasmInt32ToHeapNumber)               \
   V(WasmTaggedNonSmiToInt32)             \
@@ -71,8 +72,9 @@ struct WasmModule;
   V(WasmStackOverflow)                   \
   V(WasmThrow)                           \
   V(WasmRethrow)                         \
+  V(WasmTraceEnter)                      \
+  V(WasmTraceExit)                       \
   V(WasmTraceMemory)                     \
-  V(AllocateHeapNumber)                  \
   V(ArgumentsAdaptorTrampoline)          \
   V(BigIntToI32Pair)                     \
   V(BigIntToI64)                         \
@@ -420,6 +422,11 @@ class WasmCodeAllocator {
   size_t GetNumCodeSpaces() const;
 
  private:
+  // Sentinel value to be used for {AllocateForCodeInRegion} for specifying no
+  // restriction on the region to allocate in.
+  static constexpr base::AddressRegion kUnrestrictedRegion{
+      kNullAddress, std::numeric_limits<size_t>::max()};
+
   // The engine-wide wasm code manager.
   WasmCodeManager* const code_manager_;
 
@@ -566,7 +573,9 @@ class V8_EXPORT_PRIVATE NativeModule final {
   UseTrapHandler use_trap_handler() const { return use_trap_handler_; }
   void set_lazy_compile_frozen(bool frozen) { lazy_compile_frozen_ = frozen; }
   bool lazy_compile_frozen() const { return lazy_compile_frozen_; }
-  Vector<const uint8_t> wire_bytes() const { return wire_bytes_->as_vector(); }
+  Vector<const uint8_t> wire_bytes() const {
+    return std::atomic_load(&wire_bytes_)->as_vector();
+  }
   const WasmModule* module() const { return module_.get(); }
   std::shared_ptr<const WasmModule> shared_module() const { return module_; }
   size_t committed_code_space() const {
@@ -574,6 +583,10 @@ class V8_EXPORT_PRIVATE NativeModule final {
   }
   WasmEngine* engine() const { return engine_; }
 
+  bool HasWireBytes() const {
+    auto wire_bytes = std::atomic_load(&wire_bytes_);
+    return wire_bytes && !wire_bytes->empty();
+  }
   void SetWireBytes(OwnedVector<const uint8_t> wire_bytes);
 
   WasmCode* Lookup(Address) const;
@@ -600,18 +613,23 @@ class V8_EXPORT_PRIVATE NativeModule final {
       Vector<WasmCompilationResult>);
 
   // Set a new tiering state, but don't trigger any recompilation yet; use
-  // {TriggerRecompilation} for that. The two steps are split because In some
+  // {RecompileForTiering} for that. The two steps are split because In some
   // scenarios we need to drop locks before triggering recompilation.
   void SetTieringState(TieringState);
 
   // Check whether this modules is tiered down for debugging.
   bool IsTieredDown();
 
-  // Trigger a full recompilation of this module, in the tier set previously via
-  // {SetTieringState}. When tiering down, the calling thread contributes to
-  // compilation and only returns once recompilation is done. Tiering up happens
-  // concurrently, so this method might return before it is complete.
-  void TriggerRecompilation();
+  // Fully recompile this module in the tier set previously via
+  // {SetTieringState}. The calling thread contributes to compilation and only
+  // returns once recompilation is done.
+  void RecompileForTiering();
+
+  // Find all functions that need to be recompiled for a new tier. Note that
+  // compilation jobs might run concurrently, so this method only considers the
+  // compilation state of this native module at the time of the call.
+  // Returns a vector of function indexes to recompile.
+  std::vector<int> FindFunctionsToRecompile(TieringState);
 
   // Free a set of functions of this module. Uncommits whole pages if possible.
   // The given vector must be ordered by the instruction start address, and all
@@ -623,8 +641,15 @@ class V8_EXPORT_PRIVATE NativeModule final {
   // Retrieve the number of separately reserved code spaces for this module.
   size_t GetNumberOfCodeSpacesForTesting() const;
 
+  // Check whether there is DebugInfo for this NativeModule.
+  bool HasDebugInfo() const;
+
   // Get or create the debug info for this NativeModule.
   DebugInfo* GetDebugInfo();
+
+  uint32_t* num_liftoff_function_calls_array() {
+    return num_liftoff_function_calls_.get();
+  }
 
  private:
   friend class WasmCode;
@@ -709,6 +734,9 @@ class V8_EXPORT_PRIVATE NativeModule final {
 
   // A cache of the import wrappers, keyed on the kind and signature.
   std::unique_ptr<WasmImportWrapperCache> import_wrapper_cache_;
+
+  // Array to handle number of function calls.
+  std::unique_ptr<uint32_t[]> num_liftoff_function_calls_;
 
   // This mutex protects concurrent calls to {AddCode} and friends.
   mutable base::Mutex allocation_mutex_;

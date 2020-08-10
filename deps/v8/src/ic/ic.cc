@@ -8,6 +8,7 @@
 #include "src/api/api.h"
 #include "src/ast/ast.h"
 #include "src/base/bits.h"
+#include "src/base/logging.h"
 #include "src/builtins/accessors.h"
 #include "src/codegen/code-factory.h"
 #include "src/execution/arguments-inl.h"
@@ -599,7 +600,8 @@ bool IC::UpdatePolymorphicIC(Handle<Name> name,
   int number_of_valid_maps =
       number_of_maps - deprecated_maps - (handler_to_overwrite != -1);
 
-  if (number_of_valid_maps >= FLAG_max_polymorphic_map_count) return false;
+  if (number_of_valid_maps >= FLAG_max_valid_polymorphic_map_count)
+    return false;
   if (number_of_maps == 0 && state() != MONOMORPHIC && state() != POLYMORPHIC) {
     return false;
   }
@@ -827,8 +829,9 @@ Handle<Object> LoadIC::ComputeHandler(LookupIterator* lookup) {
         Handle<ObjectHashTable> exports(
             Handle<JSModuleNamespace>::cast(holder)->module().exports(),
             isolate());
-        InternalIndex entry = exports->FindEntry(
-            roots, lookup->name(), Smi::ToInt(lookup->name()->GetHash()));
+        InternalIndex entry =
+            exports->FindEntry(isolate(), roots, lookup->name(),
+                               Smi::ToInt(lookup->name()->GetHash()));
         // We found the accessor, so the entry must exist.
         DCHECK(entry.is_found());
         int index = ObjectHashTable::EntryToValueIndex(entry);
@@ -947,7 +950,9 @@ Handle<Object> LoadIC::ComputeHandler(LookupIterator* lookup) {
         TRACE_HANDLER_STATS(isolate(), LoadIC_LoadNormalDH);
         if (receiver_is_holder) return smi_handler;
         TRACE_HANDLER_STATS(isolate(), LoadIC_LoadNormalFromPrototypeDH);
-
+      } else if (lookup->IsElement(*holder)) {
+        TRACE_HANDLER_STATS(isolate(), LoadIC_SlowStub);
+        return LoadHandler::LoadSlow(isolate());
       } else {
         DCHECK_EQ(kField, lookup->property_details().location());
         FieldIndex field = lookup->GetFieldIndex();
@@ -1075,7 +1080,7 @@ void KeyedLoadIC::UpdateLoadElement(Handle<HeapObject> receiver,
   // If the maximum number of receiver maps has been exceeded, use the generic
   // version of the IC.
   if (static_cast<int>(target_receiver_maps.size()) >
-      FLAG_max_polymorphic_map_count) {
+      FLAG_max_valid_polymorphic_map_count) {
     set_slow_stub_reason("max polymorph exceeded");
     return;
   }
@@ -1769,6 +1774,12 @@ MaybeObjectHandle StoreIC::ComputeHandler(LookupIterator* lookup) {
         return MaybeObjectHandle(StoreHandler::StoreNormal(isolate()));
       }
 
+      // -------------- Elements (for TypedArrays) -------------
+      if (lookup->IsElement(*holder)) {
+        TRACE_HANDLER_STATS(isolate(), StoreIC_SlowStub);
+        return MaybeObjectHandle(StoreHandler::StoreSlow(isolate()));
+      }
+
       // -------------- Fields --------------
       if (lookup->property_details().location() == kField) {
         TRACE_HANDLER_STATS(isolate(), StoreIC_StoreFieldDH);
@@ -1856,6 +1867,12 @@ void KeyedStoreIC::UpdateStoreElement(Handle<Map> receiver_map,
     if (receiver_map.is_identical_to(previous_receiver_map) &&
         new_receiver_map.is_identical_to(receiver_map) &&
         old_store_mode == STANDARD_STORE && store_mode != STANDARD_STORE) {
+      if (receiver_map->IsJSArrayMap() &&
+          JSArray::MayHaveReadOnlyLength(*receiver_map)) {
+        set_slow_stub_reason(
+            "can't generalize store mode (potentially read-only length)");
+        return;
+      }
       // A "normal" IC that handles stores can switch to a version that can
       // grow at the end of the array, handle OOB accesses or copy COW arrays
       // and still stay MONOMORPHIC.
@@ -1884,7 +1901,7 @@ void KeyedStoreIC::UpdateStoreElement(Handle<Map> receiver_map,
   // If the maximum number of receiver maps has been exceeded, use the
   // megamorphic version of the IC.
   if (static_cast<int>(target_maps_and_handlers.size()) >
-      FLAG_max_polymorphic_map_count) {
+      FLAG_max_valid_polymorphic_map_count) {
     return;
   }
 
@@ -1900,13 +1917,18 @@ void KeyedStoreIC::UpdateStoreElement(Handle<Map> receiver_map,
   }
 
   // If the store mode isn't the standard mode, make sure that all polymorphic
-  // receivers are either external arrays, or all "normal" arrays. Otherwise,
-  // use the megamorphic stub.
+  // receivers are either external arrays, or all "normal" arrays with writable
+  // length. Otherwise, use the megamorphic stub.
   if (store_mode != STANDARD_STORE) {
     size_t external_arrays = 0;
     for (MapAndHandler map_and_handler : target_maps_and_handlers) {
       Handle<Map> map = map_and_handler.first;
-      if (map->has_typed_array_elements()) {
+      if (map->IsJSArrayMap() && JSArray::MayHaveReadOnlyLength(*map)) {
+        set_slow_stub_reason(
+            "unsupported combination of arrays (potentially read-only length)");
+        return;
+
+      } else if (map->has_typed_array_elements()) {
         DCHECK(!IsStoreInArrayLiteralICKind(kind()));
         external_arrays++;
       }

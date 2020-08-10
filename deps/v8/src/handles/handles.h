@@ -18,7 +18,6 @@ namespace v8 {
 namespace internal {
 
 // Forward declarations.
-class DeferredHandles;
 class HandleScopeImplementer;
 class Isolate;
 class LocalHeap;
@@ -199,6 +198,15 @@ class HandleScope {
   explicit inline HandleScope(Isolate* isolate);
   inline HandleScope(HandleScope&& other) V8_NOEXCEPT;
 
+  // Allow placement new.
+  void* operator new(size_t size, void* storage) {
+    return ::operator new(size, storage);
+  }
+
+  // Prevent heap allocation or illegal handle scopes.
+  void* operator new(size_t size) = delete;
+  void operator delete(void* size_t) = delete;
+
   inline ~HandleScope();
 
   inline HandleScope& operator=(HandleScope&& other) V8_NOEXCEPT;
@@ -234,10 +242,6 @@ class HandleScope {
   static const int kCheckHandleThreshold = 30 * 1024;
 
  private:
-  // Prevent heap allocation or illegal handle scopes.
-  void* operator new(size_t size);
-  void operator delete(void* size_t);
-
   Isolate* isolate_;
   Address* prev_next_;
   Address* prev_limit_;
@@ -255,10 +259,10 @@ class HandleScope {
 #endif
 
   friend class v8::HandleScope;
-  friend class DeferredHandles;
-  friend class DeferredHandleScope;
   friend class HandleScopeImplementer;
   friend class Isolate;
+  friend class LocalHandles;
+  friend class PersistentHandles;
 
   DISALLOW_COPY_AND_ASSIGN(HandleScope);
 };
@@ -291,48 +295,6 @@ class V8_EXPORT_PRIVATE CanonicalHandleScope final {
   CanonicalHandleScope* prev_canonical_scope_;
 
   friend class HandleScope;
-};
-
-// A DeferredHandleScope is a HandleScope in which handles are not destroyed
-// when the DeferredHandleScope is left. Instead the DeferredHandleScope has to
-// be detached with {Detach}, and the result of {Detach} has to be destroyed
-// explicitly. A DeferredHandleScope should only be used with the following
-// design pattern:
-// 1) Open a HandleScope (not a DeferredHandleScope).
-//    HandleScope scope(isolate_);
-// 2) Create handles.
-//    Handle<Object> h1 = handle(object1, isolate);
-//    Handle<Object> h2 = handle(object2, isolate);
-// 3) Open a DeferredHandleScope.
-//    DeferredHandleScope deferred_scope(isolate);
-// 4) Reopen handles which should be in the DeferredHandleScope, e.g only h1.
-//    h1 = handle(*h1, isolate);
-// 5) Detach the DeferredHandleScope.
-//    DeferredHandles* deferred_handles = deferred_scope.Detach();
-// 6) Destroy the deferred handles.
-//    delete deferred_handles;
-//
-// Note: A DeferredHandleScope must not be opened within a DeferredHandleScope.
-class V8_EXPORT_PRIVATE DeferredHandleScope final {
- public:
-  explicit DeferredHandleScope(Isolate* isolate);
-  // The DeferredHandles object returned stores the Handles created
-  // since the creation of this DeferredHandleScope.  The Handles are
-  // alive as long as the DeferredHandles object is alive.
-  std::unique_ptr<DeferredHandles> Detach();
-  ~DeferredHandleScope();
-
- private:
-  Address* prev_limit_;
-  Address* prev_next_;
-  HandleScopeImplementer* impl_;
-
-#ifdef DEBUG
-  bool handles_detached_ = false;
-  int prev_level_;
-#endif
-
-  friend class HandleScopeImplementer;
 };
 
 // Seal off the current HandleScope so that new handles can only be created

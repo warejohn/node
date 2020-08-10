@@ -37,8 +37,6 @@ class BaseConsumedPreparseData : public ConsumedPreparseData {
  public:
   class ByteData : public PreparseByteDataConstants {
    public:
-    ByteData() {}
-
     // Reading from the ByteData is only allowed when a ReadingScope is on the
     // stack. This ensures that we have a DisallowHeapAllocation in place
     // whenever ByteData holds a raw pointer into the heap.
@@ -225,7 +223,7 @@ class ZonePreparseData : public ZoneObject {
 ZonePreparseData* PreparseDataBuilder::ByteData::CopyToZone(
     Zone* zone, int children_length) {
   DCHECK(is_finalized_);
-  return new (zone) ZonePreparseData(zone, &zone_byte_data_, children_length);
+  return zone->New<ZonePreparseData>(zone, &zone_byte_data_, children_length);
 }
 
 // Implementation of ConsumedPreparseData for PreparseData

@@ -62,6 +62,20 @@ static const char kDebuggerNotPaused[] =
 
 static const size_t kBreakpointHintMaxLength = 128;
 static const intptr_t kBreakpointHintMaxSearchOffset = 80 * 10;
+// Limit the number of breakpoints returned, as we otherwise may exceed
+// the maximum length of a message in mojo (see https://crbug.com/1105172).
+static const size_t kMaxNumBreakpoints = 1000;
+
+// TODO(1099680): getScriptSource and getWasmBytecode return Wasm wire bytes
+// as protocol::Binary, which is encoded as JSON string in the communication
+// to the DevTools front-end and hence leads to either crashing the renderer
+// that is being debugged or the renderer that's running the front-end if we
+// allow arbitrarily big Wasm byte sequences here. Ideally we would find a
+// different way to transfer the wire bytes (middle- to long-term), but as a
+// short-term solution, we should at least not crash.
+static const size_t kWasmBytecodeMaxLength = (v8::String::kMaxLength / 4) * 3;
+static const char kWasmBytecodeExceedsTransferLimit[] =
+    "WebAssembly bytecode exceeds the transfer limit";
 
 namespace {
 
@@ -725,7 +739,12 @@ Response V8DebuggerAgentImpl::getPossibleBreakpoints(
 
   *locations =
       std::make_unique<protocol::Array<protocol::Debugger::BreakLocation>>();
-  for (size_t i = 0; i < v8Locations.size(); ++i) {
+
+  // TODO(1106269): Return an error instead of capping the number of
+  // breakpoints.
+  const size_t numBreakpointsToSend =
+      std::min(v8Locations.size(), kMaxNumBreakpoints);
+  for (size_t i = 0; i < numBreakpointsToSend; ++i) {
     std::unique_ptr<protocol::Debugger::BreakLocation> breakLocation =
         protocol::Debugger::BreakLocation::create()
             .setScriptId(scriptId)
@@ -978,6 +997,9 @@ Response V8DebuggerAgentImpl::getScriptSource(
   *scriptSource = it->second->source(0);
   v8::MemorySpan<const uint8_t> span;
   if (it->second->wasmBytecode().To(&span)) {
+    if (span.size() > kWasmBytecodeMaxLength) {
+      return Response::ServerError(kWasmBytecodeExceedsTransferLimit);
+    }
     *bytecode = protocol::Binary::fromSpan(span.data(), span.size());
   }
   return Response::Success();
@@ -993,6 +1015,9 @@ Response V8DebuggerAgentImpl::getWasmBytecode(const String16& scriptId,
   if (!it->second->wasmBytecode().To(&span))
     return Response::ServerError("Script with id " + scriptId.utf8() +
                                  " is not WebAssembly");
+  if (span.size() > kWasmBytecodeMaxLength) {
+    return Response::ServerError(kWasmBytecodeExceedsTransferLimit);
+  }
   *bytecode = protocol::Binary::fromSpan(span.data(), span.size());
   return Response::Success();
 }
@@ -1053,14 +1078,17 @@ Response V8DebuggerAgentImpl::resume(Maybe<bool> terminateOnResume) {
   return Response::Success();
 }
 
-Response V8DebuggerAgentImpl::stepOver() {
+Response V8DebuggerAgentImpl::stepOver(
+    Maybe<protocol::Array<protocol::Debugger::LocationRange>> inSkipList) {
   if (!isPaused()) return Response::ServerError(kDebuggerNotPaused);
   m_session->releaseObjectGroup(kBacktraceObjectGroup);
   m_debugger->stepOverStatement(m_session->contextGroupId());
   return Response::Success();
 }
 
-Response V8DebuggerAgentImpl::stepInto(Maybe<bool> inBreakOnAsyncCall) {
+Response V8DebuggerAgentImpl::stepInto(
+    Maybe<bool> inBreakOnAsyncCall,
+    Maybe<protocol::Array<protocol::Debugger::LocationRange>> inSkipList) {
   if (!isPaused()) return Response::ServerError(kDebuggerNotPaused);
   m_session->releaseObjectGroup(kBacktraceObjectGroup);
   m_debugger->stepIntoStatement(m_session->contextGroupId(),
@@ -1534,11 +1562,11 @@ void V8DebuggerAgentImpl::didParseSource(
   bool isModule = script->isModule();
   String16 scriptId = script->scriptId();
   String16 scriptURL = script->sourceURL();
+  String16 embedderName = script->embedderName();
   String16 scriptLanguage = getScriptLanguage(*script);
-  Maybe<int> codeOffset =
-      script->getLanguage() == V8DebuggerScript::Language::JavaScript
-          ? Maybe<int>()
-          : script->codeOffset();
+  Maybe<int> codeOffset;
+  if (script->getLanguage() == V8DebuggerScript::Language::WebAssembly)
+    codeOffset = script->codeOffset();
   std::unique_ptr<protocol::Debugger::DebugSymbols> debugSymbols =
       getDebugSymbols(*script);
 
@@ -1577,19 +1605,17 @@ void V8DebuggerAgentImpl::didParseSource(
         scriptRef->hash(), std::move(executionContextAuxDataParam),
         std::move(sourceMapURLParam), hasSourceURLParam, isModuleParam,
         scriptRef->length(), std::move(stackTrace), std::move(codeOffset),
-        std::move(scriptLanguage));
+        std::move(scriptLanguage), embedderName);
     return;
   }
 
-  // TODO(herhut, dgozman): Report correct length for Wasm if needed for
-  // coverage. Or do not send the length at all and change coverage instead.
   if (scriptRef->isSourceLoadedLazily()) {
     m_frontend.scriptParsed(
         scriptId, scriptURL, 0, 0, 0, 0, contextId, scriptRef->hash(),
         std::move(executionContextAuxDataParam), isLiveEditParam,
         std::move(sourceMapURLParam), hasSourceURLParam, isModuleParam, 0,
         std::move(stackTrace), std::move(codeOffset), std::move(scriptLanguage),
-        std::move(debugSymbols));
+        std::move(debugSymbols), embedderName);
   } else {
     m_frontend.scriptParsed(
         scriptId, scriptURL, scriptRef->startLine(), scriptRef->startColumn(),
@@ -1598,7 +1624,7 @@ void V8DebuggerAgentImpl::didParseSource(
         isLiveEditParam, std::move(sourceMapURLParam), hasSourceURLParam,
         isModuleParam, scriptRef->length(), std::move(stackTrace),
         std::move(codeOffset), std::move(scriptLanguage),
-        std::move(debugSymbols));
+        std::move(debugSymbols), embedderName);
   }
 
   std::vector<protocol::DictionaryValue*> potentialBreakpoints;
@@ -1712,10 +1738,11 @@ void V8DebuggerAgentImpl::didPause(
                                  WrapMode::kNoPreview, &obj);
       std::unique_ptr<protocol::DictionaryValue> breakAuxData;
       if (obj) {
-        breakAuxData = obj->toValue();
+        std::vector<uint8_t> serialized;
+        obj->AppendSerialized(&serialized);
+        breakAuxData = protocol::DictionaryValue::cast(
+            protocol::Value::parseBinary(serialized.data(), serialized.size()));
         breakAuxData->setBoolean("uncaught", isUncaught);
-      } else {
-        breakAuxData = nullptr;
       }
       hitReasons.push_back(
           std::make_pair(breakReason, std::move(breakAuxData)));
@@ -1842,7 +1869,6 @@ void V8DebuggerAgentImpl::reset() {
   m_scripts.clear();
   m_cachedScriptIds.clear();
   m_cachedScriptSize = 0;
-  m_breakpointIdToDebuggerBreakpointIds.clear();
 }
 
 void V8DebuggerAgentImpl::ScriptCollected(const V8DebuggerScript* script) {

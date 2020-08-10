@@ -14,6 +14,7 @@
 #include "src/heap/mark-compact-inl.h"
 #include "src/heap/memory-chunk-inl.h"
 #include "src/heap/objects-visiting-inl.h"
+#include "src/heap/remembered-set-inl.h"
 #include "src/heap/scavenger-inl.h"
 #include "src/heap/sweeper.h"
 #include "src/objects/data-handler-inl.h"
@@ -266,6 +267,17 @@ void ScavengerCollector::CollectGarbage() {
 
   {
     Sweeper* sweeper = heap_->mark_compact_collector()->sweeper();
+
+    // Try to finish sweeping here, such that the following code doesn't need to
+    // pause & resume sweeping.
+    if (sweeper->sweeping_in_progress() && FLAG_concurrent_sweeping &&
+        !sweeper->AreSweeperTasksRunning()) {
+      // At this point we know that all concurrent sweeping tasks have run
+      // out-of-work and quit: all pages are swept. The main thread still needs
+      // to complete sweeping though.
+      heap_->mark_compact_collector()->EnsureSweepingCompleted();
+    }
+
     // Pause the concurrent sweeper.
     Sweeper::PauseOrCompleteScope pause_scope(sweeper);
     // Filter out pages from the sweeper that need to be processed for old to
@@ -328,17 +340,16 @@ void ScavengerCollector::CollectGarbage() {
       // Scavenge weak global handles.
       TRACE_GC(heap_->tracer(),
                GCTracer::Scope::SCAVENGER_SCAVENGE_WEAK_GLOBAL_HANDLES_PROCESS);
-      isolate_->global_handles()->MarkYoungWeakUnmodifiedObjectsPending(
+      isolate_->global_handles()->MarkYoungWeakDeadObjectsPending(
           &IsUnscavengedHeapObjectSlot);
-      isolate_->global_handles()->IterateYoungWeakUnmodifiedRootsForFinalizers(
+      isolate_->global_handles()->IterateYoungWeakDeadObjectsForFinalizers(
           &root_scavenge_visitor);
       scavengers[kMainThreadId]->Process();
 
       DCHECK(copied_list.IsEmpty());
       DCHECK(promotion_list.IsEmpty());
-      isolate_->global_handles()
-          ->IterateYoungWeakUnmodifiedRootsForPhantomHandles(
-              &root_scavenge_visitor, &IsUnscavengedHeapObjectSlot);
+      isolate_->global_handles()->IterateYoungWeakObjectsForPhantomHandles(
+          &root_scavenge_visitor, &IsUnscavengedHeapObjectSlot);
     }
 
     {
@@ -524,7 +535,7 @@ void Scavenger::IterateAndScavengePromotedObject(HeapObject target, Map map,
   target.IterateBodyFast(map, size, &visitor);
 
   if (map.IsJSArrayBufferMap()) {
-    DCHECK(!MemoryChunk::FromHeapObject(target)->IsLargePage());
+    DCHECK(!BasicMemoryChunk::FromHeapObject(target)->IsLargePage());
     JSArrayBuffer::cast(target).YoungMarkExtensionPromoted();
   }
 }

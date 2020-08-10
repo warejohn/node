@@ -177,7 +177,7 @@ Object GlobalDictionaryShape::Unwrap(Object object) {
   return PropertyCell::cast(object).name();
 }
 
-Handle<Map> GlobalDictionaryShape::GetMap(ReadOnlyRoots roots) {
+Handle<Map> GlobalDictionary::GetMap(ReadOnlyRoots roots) {
   return roots.global_dictionary_map_handle();
 }
 
@@ -190,7 +190,7 @@ Name NameDictionary::NameAt(const Isolate* isolate, InternalIndex entry) {
   return Name::cast(KeyAt(isolate, entry));
 }
 
-Handle<Map> NameDictionaryShape::GetMap(ReadOnlyRoots roots) {
+Handle<Map> NameDictionary::GetMap(ReadOnlyRoots roots) {
   return roots.name_dictionary_map_handle();
 }
 
@@ -203,15 +203,6 @@ PropertyCell GlobalDictionary::CellAt(const Isolate* isolate,
                                       InternalIndex entry) {
   DCHECK(KeyAt(isolate, entry).IsPropertyCell(isolate));
   return PropertyCell::cast(KeyAt(isolate, entry));
-}
-
-bool GlobalDictionaryShape::IsLive(ReadOnlyRoots roots, Object k) {
-  DCHECK_NE(roots.the_hole_value(), k);
-  return k != roots.undefined_value();
-}
-
-bool GlobalDictionaryShape::IsKey(ReadOnlyRoots roots, Object k) {
-  return IsLive(roots, k) && !PropertyCell::cast(k).value().IsTheHole(roots);
 }
 
 Name GlobalDictionary::NameAt(InternalIndex entry) {
@@ -237,6 +228,11 @@ void GlobalDictionary::SetEntry(InternalIndex entry, Object key, Object value,
   DCHECK_EQ(key, PropertyCell::cast(value).name());
   set(EntryToIndex(entry) + kEntryKeyIndex, value);
   DetailsAtPut(entry, details);
+}
+
+void GlobalDictionary::ClearEntry(InternalIndex entry) {
+  Object the_hole = this->GetReadOnlyRoots().the_hole_value();
+  set(EntryToIndex(entry) + kEntryKeyIndex, the_hole);
 }
 
 void GlobalDictionary::ValueAtPut(InternalIndex entry, Object value) {
@@ -269,11 +265,11 @@ Handle<Object> NumberDictionaryBaseShape::AsHandle(OffThreadIsolate* isolate,
   return isolate->factory()->NewNumberFromUint<AllocationType::kOld>(key);
 }
 
-Handle<Map> NumberDictionaryShape::GetMap(ReadOnlyRoots roots) {
+Handle<Map> NumberDictionary::GetMap(ReadOnlyRoots roots) {
   return roots.number_dictionary_map_handle();
 }
 
-Handle<Map> SimpleNumberDictionaryShape::GetMap(ReadOnlyRoots roots) {
+Handle<Map> SimpleNumberDictionary::GetMap(ReadOnlyRoots roots) {
   return roots.simple_number_dictionary_map_handle();
 }
 
