@@ -10,6 +10,7 @@
 </tr>
 <tr>
 <td>
+<a href="#14.10.0">14.10.0</a><br/>
 <a href="#14.9.0">14.9.0</a><br/>
 <a href="#14.8.0">14.8.0</a><br/>
 <a href="#14.7.0">14.7.0</a><br/>
@@ -39,6 +40,69 @@
   * [0.10.x](CHANGELOG_V010.md)
   * [io.js](CHANGELOG_IOJS.md)
   * [Archive](CHANGELOG_ARCHIVE.md)
+
+<a id="14.10.0"></a>
+## 2020-09-08, Version 14.10.0 (Current), @richardlau
+
+### Notable Changes
+
+* [[`2ab33c58ae`](https://github.com/nodejs/node/commit/2ab33c58ae)] - **(SEMVER-MINOR)** **buffer**: also alias BigUInt methods (Anna Henningsen) [#34960](https://github.com/nodejs/node/pull/34960)
+* [[`8aac42caf2`](https://github.com/nodejs/node/commit/8aac42caf2)] - **(SEMVER-MINOR)** **perf_hooks**: add idleTime and event loop util (Trevor Norris) [#34938](https://github.com/nodejs/node/pull/34938)
+
+### Commits
+
+* [[`2ab33c58ae`](https://github.com/nodejs/node/commit/2ab33c58ae)] - **(SEMVER-MINOR)** **buffer**: also alias BigUInt methods (Anna Henningsen) [#34960](https://github.com/nodejs/node/pull/34960)
+* [[`7b7299012e`](https://github.com/nodejs/node/commit/7b7299012e)] - **build**: comment about auto close when stalled via with github action (Phillip Johnsen) [#34555](https://github.com/nodejs/node/pull/34555)
+* [[`d6c796b4ab`](https://github.com/nodejs/node/commit/d6c796b4ab)] - **build**: close stalled issues and PRs with github action (Phillip Johnsen) [#34555](https://github.com/nodejs/node/pull/34555)
+* [[`46766a10df`](https://github.com/nodejs/node/commit/46766a10df)] - **build**: use autorebase option for git node land (Denys Otrishko) [#34969](https://github.com/nodejs/node/pull/34969)
+* [[`7afb67f491`](https://github.com/nodejs/node/commit/7afb67f491)] - **build**: use latest node-core-utils from npm (Denys Otrishko) [#34969](https://github.com/nodejs/node/pull/34969)
+* [[`d06e158253`](https://github.com/nodejs/node/commit/d06e158253)] - **build**: add support for build on arm64 (Evan Lucas) [#34238](https://github.com/nodejs/node/pull/34238)
+* [[`755f9e4bc8`](https://github.com/nodejs/node/commit/755f9e4bc8)] - **build,deps**: add gen-openssl target (Evan Lucas) [#34642](https://github.com/nodejs/node/pull/34642)
+* [[`90f9348297`](https://github.com/nodejs/node/commit/90f9348297)] - **deps**: update brotli to v1.0.9 (Anna Henningsen) [#34937](https://github.com/nodejs/node/pull/34937)
+* [[`f1fcd6646d`](https://github.com/nodejs/node/commit/f1fcd6646d)] - **deps**: add openssl support for arm64 (Evan Lucas) [#34238](https://github.com/nodejs/node/pull/34238)
+* [[`9aba579acb`](https://github.com/nodejs/node/commit/9aba579acb)] - **doc**: change effected to affected (Turner Jabbour) [#34989](https://github.com/nodejs/node/pull/34989)
+* [[`2598527112`](https://github.com/nodejs/node/commit/2598527112)] - **doc**: drop the --production flag for installing windows-build-tools (DeeDeeG) [#34979](https://github.com/nodejs/node/pull/34979)
+* [[`287ce7b810`](https://github.com/nodejs/node/commit/287ce7b810)] - **doc**: fix broken link to response.writableFinished in deprecations doc (Rich Trott) [#34983](https://github.com/nodejs/node/pull/34983)
+* [[`a0656ff863`](https://github.com/nodejs/node/commit/a0656ff863)] - **doc**: fix broken link to response.finished in deprecations doc (Rich Trott) [#34982](https://github.com/nodejs/node/pull/34982)
+* [[`f4524b8936`](https://github.com/nodejs/node/commit/f4524b8936)] - **doc**: fix broken link to writableEnded in deprecations doc (Rich Trott) [#34984](https://github.com/nodejs/node/pull/34984)
+* [[`514a538f64`](https://github.com/nodejs/node/commit/514a538f64)] - **doc**: fix typos in buffer doc (Robert Williams) [#34981](https://github.com/nodejs/node/pull/34981)
+* [[`df76c89b78`](https://github.com/nodejs/node/commit/df76c89b78)] - **doc**: recommend URL() over url.parse() in http2 doc (Rich Trott) [#34978](https://github.com/nodejs/node/pull/34978)
+* [[`ca0302e4f1`](https://github.com/nodejs/node/commit/ca0302e4f1)] - **doc**: arrange perf\_hooks entries alphabetically (Rich Trott) [#34973](https://github.com/nodejs/node/pull/34973)
+* [[`94c6e09367`](https://github.com/nodejs/node/commit/94c6e09367)] - **doc**: replace require() with reference links in http2.md (Rich Trott) [#34956](https://github.com/nodejs/node/pull/34956)
+* [[`2407a7a671`](https://github.com/nodejs/node/commit/2407a7a671)] - **doc**: add a note about possible missing lines to readline.asyncIterator (Igor Mikhalev) [#34675](https://github.com/nodejs/node/pull/34675)
+* [[`31098a4c0e`](https://github.com/nodejs/node/commit/31098a4c0e)] - **doc**: make minor improvements to query string sentence in http2.md (Rich Trott) [#34929](https://github.com/nodejs/node/pull/34929)
+* [[`1589f0e6f4`](https://github.com/nodejs/node/commit/1589f0e6f4)] - **doc**: make general copy-edit changes to policy.md (Rich Trott) [#34943](https://github.com/nodejs/node/pull/34943)
+* [[`aee3b8510b`](https://github.com/nodejs/node/commit/aee3b8510b)] - **doc**: simplify "make use of" to "use" (Rich Trott) [#34861](https://github.com/nodejs/node/pull/34861)
+* [[`0e09ff8ab1`](https://github.com/nodejs/node/commit/0e09ff8ab1)] - **doc**: make minor fixes to maintaining-openssl.md (Rich Trott) [#34926](https://github.com/nodejs/node/pull/34926)
+* [[`b091681d25`](https://github.com/nodejs/node/commit/b091681d25)] - **doc**: fix CHANGELOG.md parsing issue (Juan José Arboleda) [#34923](https://github.com/nodejs/node/pull/34923)
+* [[`fbd18be459`](https://github.com/nodejs/node/commit/fbd18be459)] - **doc**: provide more guidance about process.version (Rich Trott) [#34909](https://github.com/nodejs/node/pull/34909)
+* [[`4782ec7b3b`](https://github.com/nodejs/node/commit/4782ec7b3b)] - **doc**: use consistent typography for node-addon-api (Rich Trott) [#34910](https://github.com/nodejs/node/pull/34910)
+* [[`2fe95094fd`](https://github.com/nodejs/node/commit/2fe95094fd)] - **doc**: improve link-local text in dgram.md (Rich Trott) [#34868](https://github.com/nodejs/node/pull/34868)
+* [[`657292e2dd`](https://github.com/nodejs/node/commit/657292e2dd)] - **doc**: fix broken markdown/display in cli.html (Rich Trott) [#34892](https://github.com/nodejs/node/pull/34892)
+* [[`4cf93bb3cf`](https://github.com/nodejs/node/commit/4cf93bb3cf)] - **doc**: use "previous"/"preceding" instead of "above" as modifier (Rich Trott) [#34877](https://github.com/nodejs/node/pull/34877)
+* [[`29b048b06b`](https://github.com/nodejs/node/commit/29b048b06b)] - **doc**: use links to MS guide in style guide (Rich Trott) [#34871](https://github.com/nodejs/node/pull/34871)
+* [[`52be37cf39`](https://github.com/nodejs/node/commit/52be37cf39)] - **doc,tools**: remove malfunctioning Linux manpage linker (Rich Trott) [#34985](https://github.com/nodejs/node/pull/34985)
+* [[`fffba3a270`](https://github.com/nodejs/node/commit/fffba3a270)] - **errors**: use `ErrorPrototypeToString` from `primordials` object (ExE Boss) [#34891](https://github.com/nodejs/node/pull/34891)
+* [[`db8c66b8c2`](https://github.com/nodejs/node/commit/db8c66b8c2)] - **esm**: shorten ERR\_UNSUPPORTED\_ESM\_URL\_SCHEME message (Rich Trott) [#34836](https://github.com/nodejs/node/pull/34836)
+* [[`be71e717c5`](https://github.com/nodejs/node/commit/be71e717c5)] - **meta**: enable wasi for CODEOWNERS (gengjiawen) [#34889](https://github.com/nodejs/node/pull/34889)
+* [[`a43b7ff72e`](https://github.com/nodejs/node/commit/a43b7ff72e)] - **meta**: remove non-existent quic from CODEOWNERS (Richard Lau) [#34947](https://github.com/nodejs/node/pull/34947)
+* [[`3c32fe09e9`](https://github.com/nodejs/node/commit/3c32fe09e9)] - **n-api**: re-implement async env cleanup hooks (Gabriel Schulhof) [#34819](https://github.com/nodejs/node/pull/34819)
+* [[`fcb211f38a`](https://github.com/nodejs/node/commit/fcb211f38a)] - **net**: replace usage of internal stream state with public api (Denys Otrishko) [#34885](https://github.com/nodejs/node/pull/34885)
+* [[`8aac42caf2`](https://github.com/nodejs/node/commit/8aac42caf2)] - **(SEMVER-MINOR)** **perf_hooks**: add idleTime and event loop util (Trevor Norris) [#34938](https://github.com/nodejs/node/pull/34938)
+* [[`18b04ab4c8`](https://github.com/nodejs/node/commit/18b04ab4c8)] - **policy**: implement scopes field (Bradley Farias) [#34552](https://github.com/nodejs/node/pull/34552)
+* [[`f6a5999a9d`](https://github.com/nodejs/node/commit/f6a5999a9d)] - **src,doc**: fix wording to refer to context, not environment (Turner Jabbour) [#34880](https://github.com/nodejs/node/pull/34880)
+* [[`bcc1d431f8`](https://github.com/nodejs/node/commit/bcc1d431f8)] - **src,doc**: fix grammar due to missing 'is' (Turner Jabbour) [#34897](https://github.com/nodejs/node/pull/34897)
+* [[`044297ff10`](https://github.com/nodejs/node/commit/044297ff10)] - **src,doc**: rephrase for clarity (Turner Jabbour) [#34879](https://github.com/nodejs/node/pull/34879)
+* [[`5f24cea11a`](https://github.com/nodejs/node/commit/5f24cea11a)] - **stream**: fix Readable stream state properties (Denys Otrishko) [#34886](https://github.com/nodejs/node/pull/34886)
+* [[`f537c868b9`](https://github.com/nodejs/node/commit/f537c868b9)] - **stream**: allow using `.push()`/`.unshift()` during `once('data')` (Anna Henningsen) [#34957](https://github.com/nodejs/node/pull/34957)
+* [[`b698d2ec81`](https://github.com/nodejs/node/commit/b698d2ec81)] - **test**: remove incorrect debug() in test-policy-integrity (Rich Trott) [#34961](https://github.com/nodejs/node/pull/34961)
+* [[`ee6a583b9f`](https://github.com/nodejs/node/commit/ee6a583b9f)] - **test**: fix typo in test/parallel/test-icu-punycode.js (Daijiro Wachi) [#34934](https://github.com/nodejs/node/pull/34934)
+* [[`9057a1644d`](https://github.com/nodejs/node/commit/9057a1644d)] - **test**: add readline test for escape sequence (Rich Trott) [#34952](https://github.com/nodejs/node/pull/34952)
+* [[`75d16125e1`](https://github.com/nodejs/node/commit/75d16125e1)] - **test**: make test-tls-reuse-host-from-socket pass without internet (Rich Trott) [#34953](https://github.com/nodejs/node/pull/34953)
+* [[`971b7ac087`](https://github.com/nodejs/node/commit/971b7ac087)] - **test**: simplify test-vm-memleak (Rich Trott) [#34881](https://github.com/nodejs/node/pull/34881)
+* [[`fb2111e300`](https://github.com/nodejs/node/commit/fb2111e300)] - **tools,doc**: fix global table of content active element (Antoine du Hamel) [#34976](https://github.com/nodejs/node/pull/34976)
+* [[`7ad629e4e4`](https://github.com/nodejs/node/commit/7ad629e4e4)] - **tools,doc**: remove "toc" anchor name (Rich Trott) [#34893](https://github.com/nodejs/node/pull/34893)
+* [[`94528f510e`](https://github.com/nodejs/node/commit/94528f510e)] - **zlib**: replace usage of internal stream state with public api (Denys Otrishko) [#34884](https://github.com/nodejs/node/pull/34884)
 
 <a id="14.9.0"></a>
 ## 2020-08-27, Version 14.9.0 (Current), @BethGriggs prepared by @danielleadams
